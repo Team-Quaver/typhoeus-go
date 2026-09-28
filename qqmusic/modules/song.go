@@ -7,6 +7,7 @@ package modules
 
 import (
 	"encoding/json"
+	"strconv"
 
 	"github.com/team-quaver/typhoeus-go/qqmusic"
 )
@@ -117,11 +118,145 @@ func (m *SongModule) GetSongURLs(files []SongFileInfo, fileType SongFileType, op
 		Set("songmid", songmids).
 		Set("songtype", songtypes).
 		Set("ctx", 0)
+	// 非 android 平台身份的 vkey 请求必须带凭证配套字段：authst + tmeLoginType，
+	// 否则上游回 result=22（参数缺失）。web 平台走 web comm（ct=24）原样即可。
+	if plat := opt.Platform; plat == qqmusic.PlatformDesktop || plat == qqmusic.PlatformWeb {
+		cred := m.cl.Credential()
+		comm := qqmusic.NewJObj()
+		if plat == qqmusic.PlatformDesktop {
+			comm.Set("cv", "1859")
+		}
+		if cred.MusicKey != "" {
+			comm.Set("authst", cred.MusicKey)
+		}
+		if cred.LoginType != 0 {
+			comm.Set("tmeLoginType", strconv.FormatInt(cred.LoginType, 10))
+		}
+		opt.Comm = comm
+	}
+	if encrypted {
+		// 加密通道（CgiGetEVkey）必须对齐官方桌面客户端的请求形态，
+		// 否则上游一律按无权限拒绝（result=104003/101404）：
+		//   param: guid 固定 "10000"、ctx=1、loginflag=1、platform="27"、songtype 非 0；
+		//   comm:  desktop 形态（ct=19/cv=1859）+ authst + tmeLoginType。
+		// 参照 qmc-decoder ekey_fetch.rs 与 amtoaer/lyrune 的可用实现。
+		// 注意：songmid 用 media_mid（lyrune 语义），歌曲 mid 与 media_mid 不同源时
+		// 传 mid 会被上游按无该文件拒绝。
+		param.Set("guid", "10000")
+		for i, st := range songtypes {
+			if st == 0 {
+				songtypes[i] = 1
+			}
+		}
+		param.Set("songtype", songtypes)
+		param.Set("ctx", 1)
+		param.Set("loginflag", 1)
+		param.Set("platform", "27")
+		for i := range songmids {
+			if mm := files[i].MediaMid; mm != "" {
+				songmids[i] = mm
+			}
+		}
+		opt.Platform = qqmusic.PlatformDesktop
+		cred := m.cl.Credential()
+		comm := qqmusic.NewJObj().Set("cv", "1859")
+		if cred.MusicKey != "" {
+			comm.Set("authst", cred.MusicKey)
+		}
+		if cred.LoginType != 0 {
+			comm.Set("tmeLoginType", strconv.FormatInt(cred.LoginType, 10))
+		}
+		opt.Comm = comm
+	}
 	data, err := m.cl.CgiCall(module, method, param, opt)
 	if err != nil {
 		return nil, err
 	}
 	return qqmusic.ParseCGIData(data, nil)
+}
+
+// EVkeyVariant 一个加密文件变体（文件名前缀 + 扩展名，如 F0M0/.mflac）。
+type EVkeyVariant struct {
+	Pref string
+	Ext  string
+}
+
+// EVkeyEntry 批量请求里单个文件的取链结果。
+type EVkeyEntry struct {
+	Filename string
+	Purl     string
+	Vkey     string
+	Ekey     string
+	Result   int64
+}
+
+// GetEVkeyBatch 一次 CgiGetEVkey 同时问多个加密文件变体（lyrune 策略）：
+// 明文链拿不到的歌，把 master/atmos/flac/ogg 的加密形态一口气全问一遍，
+// 上游按文件逐个回 result/ekey/purl —— 谁可播用谁，而不是赌单一变体。
+// songmid 用 media_mid（与 lyrune 一致）。返回与 variants 等长的结果切片。
+func (m *SongModule) GetEVkeyBatch(mid, mediaMid string, variants []EVkeyVariant) ([]EVkeyEntry, error) {
+	if mediaMid == "" {
+		mediaMid = mid
+	}
+	filenames := make([]string, 0, len(variants))
+	songmids := make([]string, 0, len(variants))
+	for _, v := range variants {
+		filenames = append(filenames, v.Pref+mediaMid+v.Ext)
+		songmids = append(songmids, mediaMid) // lyrune：songmid = media_mid 逐条重复
+	}
+	count := len(filenames)
+	param := qqmusic.NewJObj().
+		Set("uin", m.cl.Credential().StrMusicID).
+		Set("filename", filenames).
+		Set("guid", "10000").
+		Set("songmid", songmids).
+		Set("songtype", ones(count)).
+		Set("uin", m.cl.Credential().StrMusicID).
+		Set("loginflag", 1).
+		Set("platform", "27").
+		Set("ctx", 1)
+	cred := m.cl.Credential()
+	comm := qqmusic.NewJObj().Set("cv", "1859")
+	if cred.MusicKey != "" {
+		comm.Set("authst", cred.MusicKey)
+	}
+	if cred.LoginType != 0 {
+		comm.Set("tmeLoginType", strconv.FormatInt(cred.LoginType, 10))
+	}
+	data, err := m.cl.CgiCall("music.vkey.GetEVkey", "CgiGetEVkey", param, qqmusic.CGIOption{
+		Platform: qqmusic.PlatformDesktop,
+		Comm:     comm,
+	})
+	if err != nil {
+		return nil, err
+	}
+	raw, err := qqmusic.ParseCGIData(data, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Items []struct {
+			Filename string `json:"filename"`
+			Purl     string `json:"purl"`
+			Vkey     string `json:"vkey"`
+			Ekey     string `json:"ekey"`
+			Result   int64  `json:"result"`
+		} `json:"midurlinfo"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, qqmusic.NewDataError("EVkey 批量响应解析失败")
+	}
+	entries := make([]EVkeyEntry, count)
+	for i := range entries {
+		entries[i].Result = -1 // 上游少回条目时按失败处理
+	}
+	for i, it := range resp.Items {
+		if i >= count {
+			break
+		}
+		entries[i] = EVkeyEntry{Filename: it.Filename, Purl: it.Purl, Vkey: it.Vkey, Ekey: it.Ekey, Result: it.Result}
+	}
+	return entries, nil
 }
 
 // GetCdnDispatch 获取音频 CDN 域名列表（sip）。
@@ -165,4 +300,13 @@ func isDigits(s string) bool {
 		}
 	}
 	return true
+}
+
+// ones 生成 n 个 1 的切片（EVkey 的 songtype 逐条目全 1）。
+func ones(n int) []int {
+	out := make([]int, n)
+	for i := range out {
+		out[i] = 1
+	}
+	return out
 }

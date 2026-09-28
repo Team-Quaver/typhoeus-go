@@ -7,6 +7,8 @@
 package mqtt
 
 import (
+	"os"
+
 	"context"
 	"encoding/binary"
 	"errors"
@@ -308,7 +310,9 @@ func parseConnack(pkt []byte) (byte, string) {
 }
 
 // parseProps 解析 MQTT 5.0 属性区（按各属性的真实线上格式推进）。
-// UserProperty 存为 "user:<键名>"；其余属性存为十进制 ID 字符串键。
+// UserProperty 同时以裸键名和 "user:<键名>" 两种键存入 —— 消费方按裸键取
+// （对齐 paho 的 properties 字典语义；只存 "user:" 前缀曾导致扫码推送全部
+// 匹配不上 switch，手机扫码登录静默失效）。
 func parseProps(body []byte) map[string]string {
 	out := map[string]string{}
 	for i := 0; i < len(body); {
@@ -380,6 +384,7 @@ func parseProps(body []byte) map[string]string {
 				return out
 			}
 			out["user:"+k] = string(body[i : i+n])
+			out[k] = out["user:"+k] // 裸键名：消费方按 paho 语义取 Properties["type"]
 			i += n
 		default: // 未知属性：无法安全跳过，终止解析
 			return out
@@ -392,6 +397,7 @@ func parseProps(body []byte) map[string]string {
 
 // writePacket 写一帧（gorilla 写互斥）。
 func (c *Client) writePacket(pkt []byte) error {
+	debugFrame("TX", pkt)
 	c.wsMu.Lock()
 	defer c.wsMu.Unlock()
 	if c.ws == nil {
@@ -406,7 +412,20 @@ func readOnePacket(ws *websocket.Conn) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	debugFrame("RX", data)
 	return data, nil
+}
+
+// debugFrame QSG_DEBUG_MQTT=1 时按 hex 打印帧前后缀（诊断推送不到位的字县级差异）。
+func debugFrame(dir string, data []byte) {
+	if os.Getenv("QSG_DEBUG_MQTT") == "" {
+		return
+	}
+	n := len(data)
+	if n > 280 {
+		n = 280
+	}
+	fmt.Fprintf(os.Stderr, "[MQTT %s] len=%d %x\n", dir, len(data), data[:n])
 }
 
 // readLoop 唯一的下行读取 goroutine：
@@ -432,6 +451,8 @@ func (c *Client) readLoop() {
 		switch pkt[0] >> 4 {
 		case typePingresp:
 			continue
+		default:
+			debugFrame("UNHANDLED", pkt)
 		case typeSuback:
 			if id, codes, ok := parseSuback(pkt); ok {
 				select {
@@ -499,9 +520,13 @@ func parsePublish(pkt []byte) *Message {
 		return nil
 	}
 	return &Message{
-		Topic:      topic,
+		Topic: topic,
+		// 注意：属性区必须从 varint 之后的 propsStart 起传——
+		// 从 pos 传会把长度前缀当属性字节，cookies/scanned 这类属性区
+		// 超过 127 字节的消息 varint 变两字节，parseProps 首字节即失配，
+		// 返回空表 → 所有推送 type="" 被丢弃（手机扫码登录曾因此静默失效）。
 		Payload:    pkt[propsEnd:],
-		Properties: parseProps(pkt[pos:propsEnd]),
+		Properties: parseProps(pkt[propsStart:propsEnd]),
 	}
 }
 

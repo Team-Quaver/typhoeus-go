@@ -111,6 +111,7 @@ type streamResolveBody struct {
 	Tier         string   `json:"tier"`         // typhoeus 档位 id
 	Auto         bool     `json:"auto"`         // true=自动音质模式（会员不足向下降档，不报 403）
 	Deprioritize []string `json:"deprioritize"` // 回退链降权档位（UI「回退排序」开关）
+	Platform     string   `json:"platform"`     // 取链平台身份：android(缺省)/web/desktop——严格曲库的版权判定与此相关
 }
 
 func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
@@ -126,7 +127,7 @@ func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
 		body.Tier = "128"
 	}
 	resolved, err := a.resolver.Resolve(r.Context(), body.Mid, body.MediaMid, body.Tier,
-		body.Auto, body.Deprioritize)
+		body.Auto, body.Deprioritize, body.Platform, body.SongType)
 	if err != nil {
 		writeError(w, err)
 		return

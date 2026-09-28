@@ -64,8 +64,11 @@ func (t *Tier) hasEnc() bool { return t.EncPref != "" }
 
 // 档位表（rank 升序）。明文/加密形态按实际可用性标注：
 //   - mp3 无加密孪生（官方从不下发 m* 加密 mp3）
-//   - vinyl 只有加密形态
 //   - NAC（TL01 腾讯自研 codec）浏览器不可播，不进档位表
+//   - dts/atmosdb/vinyl 三档已裁撤（2026-09-28）：DTS:X mp4 的 `dtsx` codec tag
+//     ffmpeg 不识别（mov 解复用出 codec=unknown，mpv 报「无法初始化解码器」）、
+//     AC-4 需要捆绑 ffmpeg 没有编入的解码器、黑胶无明文形态且从未被上游放行过。
+//     裁撤后 auto 回退链不再指向不可播档。
 var tierTable = []*Tier{
 	{ID: "128", Label: "标准音质", PlainPref: "M500", PlainExt: ".mp3", EncPref: "", EncExt: "", Mime: "audio/mpeg", Ext: ".mp3", Rank: 10, Requires: 0},
 	{ID: "320", Label: "高品质 HQ", PlainPref: "M800", PlainExt: ".mp3", EncPref: "", EncExt: "", Mime: "audio/mpeg", Ext: ".mp3", Rank: 20, Requires: 1},
@@ -76,9 +79,6 @@ var tierTable = []*Tier{
 	{ID: "atmos51", Label: "臻品全景声 5.1", PlainPref: "Q001", PlainExt: ".flac", EncPref: "Q0M1", EncExt: ".mflac", Mime: "audio/flac", Ext: ".flac", Rank: 55, Requires: 2},
 	{ID: "atmos71", Label: "臻品全景声 7.1", PlainPref: "Q003", PlainExt: ".ogg", EncPref: "Q0M3", EncExt: ".mgg", Mime: "audio/ogg", Ext: ".ogg", Rank: 57, Requires: 2},
 	{ID: "master", Label: "臻品母带", PlainPref: "AI00", PlainExt: ".flac", EncPref: "AIM0", EncExt: ".mflac", Mime: "audio/flac", Ext: ".flac", Rank: 60, Requires: 2},
-	{ID: "dts", Label: "DTS:X 环绕声", PlainPref: "DT03", PlainExt: ".mp4", EncPref: "DTM3", EncExt: ".mmp4", Mime: "audio/mp4", Ext: ".mp4", Rank: 65, Requires: 2},
-	{ID: "atmosdb", Label: "杜比全景声 (AC-4)", PlainPref: "D004", PlainExt: ".mp4", EncPref: "D0M4", EncExt: ".mmp4", Mime: "audio/mp4", Ext: ".mp4", Rank: 66, Requires: 2},
-	{ID: "vinyl", Label: "臻品黑胶", PlainPref: "", PlainExt: "", EncPref: "V0M0", EncExt: ".mflac", Mime: "audio/flac", Ext: ".flac", Rank: 90, Requires: 2, Encrypted: true},
 }
 
 // Tiers 档位表副本（含加密档位；本实现可解密播放）。

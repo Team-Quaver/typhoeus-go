@@ -63,6 +63,7 @@ type QRLoginResult struct {
 	Event      QRLoginEvent
 	Done       bool
 	Credential *qqmusic.Credential
+	Error      string // 非空 = 流程内错误（cookies 解析失败 / Login CGI 失败等），UI 应展示
 }
 
 // 上游登录域错误码 → 文案（_validate_result 的映射表）。
@@ -461,6 +462,7 @@ func (m *LoginModule) ConsumeMobileQR(ctx context.Context, qrcodeID string) (<-c
 		for {
 			msg, err := client.ReadMessage()
 			if err != nil {
+				logWarn("mobile 扫码 MQTT 读消息结束: %v", err)
 				return
 			}
 			switch msg.Properties["type"] {
@@ -475,6 +477,8 @@ func (m *LoginModule) ConsumeMobileQR(ctx context.Context, qrcodeID string) (<-c
 			case "loginFailed":
 				out <- &QRLoginResult{Event: EventTimeout}
 				return
+			default:
+				logWarn("mobile 扫码收到未处理消息 type=%q payload=%.160s", msg.Properties["type"], string(msg.Payload))
 			case "cookies":
 				var payload struct {
 					Cookies map[string]struct {
@@ -482,11 +486,15 @@ func (m *LoginModule) ConsumeMobileQR(ctx context.Context, qrcodeID string) (<-c
 					} `json:"cookies"`
 				}
 				if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+					logWarn("mobile 扫码 cookies 消息解析失败: %v（payload=%.200s）", err, string(msg.Payload))
+					out <- &QRLoginResult{Event: EventTimeout, Error: "登录消息解析失败"}
 					return
 				}
 				uin := payload.Cookies["qqmusic_uin"].Value
 				key := payload.Cookies["qqmusic_key"].Value
 				if uin == "" || key == "" {
+					logWarn("mobile 扫码 cookies 缺少 uin/key（payload=%.200s）", string(msg.Payload))
+					out <- &QRLoginResult{Event: EventTimeout, Error: "登录消息缺少凭据字段"}
 					return
 				}
 				musicID, _ := strconv.ParseInt(uin, 10, 64)
@@ -497,10 +505,14 @@ func (m *LoginModule) ConsumeMobileQR(ctx context.Context, qrcodeID string) (<-c
 						Set("token", key),
 					qqmusic.NewJObj().Set("tmeLoginType", 6))
 				if err != nil {
+					logWarn("mobile 扫码 Login CGI 失败: %v", err)
+					out <- &QRLoginResult{Event: EventTimeout, Error: "凭证换取失败: " + err.Error()}
 					return
 				}
 				cred, err := validateLoginResponse(item)
 				if err != nil {
+					logWarn("mobile 扫码 Login 响应校验失败: %v", err)
+					out <- &QRLoginResult{Event: EventTimeout, Error: "凭证校验失败: " + err.Error()}
 					return
 				}
 				out <- &QRLoginResult{Event: EventDone, Done: true, Credential: cred}

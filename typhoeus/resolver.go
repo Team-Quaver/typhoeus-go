@@ -44,7 +44,7 @@ func NewStreamResolver(provider *QQMusicProvider) *StreamResolver {
 // 每个候选档位先试明文形态，再试加密形态（需会员且有 ekey）——这是本实现
 // 相对 Python 版的核心增强：FLAC/臻品系大量歌曲只有加密源可得。
 func (r *StreamResolver) Resolve(ctx context.Context, mid, mediaMid, tierID string,
-	autoDowngrade bool, deprioritize []string) (*ResolvedStream, error) {
+	autoDowngrade bool, deprioritize []string, platform string, songType int) (*ResolvedStream, error) {
 
 	target, err := TierByID(tierID)
 	if err != nil {
@@ -69,7 +69,7 @@ func (r *StreamResolver) Resolve(ctx context.Context, mid, mediaMid, tierID stri
 		}
 		// 1) 明文形态
 		if tier.hasPlain() {
-			links, err := r.provider.resolveLinks(ctx, mid, mediaMid, *plainType(tier))
+			links, err := r.provider.resolveLinksPlatform(ctx, mid, mediaMid, *plainType(tier), platform, songType)
 			if err != nil {
 				return nil, err
 			}
@@ -88,7 +88,7 @@ func (r *StreamResolver) Resolve(ctx context.Context, mid, mediaMid, tierID stri
 		}
 		// 2) 加密形态（需 ekey；解密器仅驻内存）
 		if tier.hasEnc() {
-			links, err := r.provider.resolveLinks(ctx, mid, mediaMid, *encType(tier))
+			links, err := r.provider.resolveLinksPlatform(ctx, mid, mediaMid, *encType(tier), platform, songType)
 			if err != nil {
 				return nil, err
 			}
@@ -116,7 +116,76 @@ func (r *StreamResolver) Resolve(ctx context.Context, mid, mediaMid, tierID stri
 			}, nil
 		}
 	}
+	// 兜底（lyrune 策略）：整条链都失败时，把链上所有加密变体合并进一次
+	// CgiGetEVkey 批量请求。上游按文件逐个判定——单变体请求被拒的歌，
+	// 批量请求里可能恰有变体放行（不同加密形态的授权判定相互独立）。
+	for _, tier := range chain {
+		if !tier.hasEnc() || Membership(tier.Requires) > membership {
+			continue
+		}
+		hit, err := r.resolveEncryptedBatch(ctx, mid, mediaMid, tier)
+		if err != nil {
+			continue
+		}
+		return hit, nil
+	}
 	return nil, errProvider(fmt.Sprintf("无可播档位（最后上游 result=%d）", lastCode))
+}
+
+// resolveEncryptedBatch 把单个档位的加密形态交给批量 EVkey 请求处理：
+// 同一请求里带上全档位加密变体（rank ≤ 该档位），命中哪个回哪个。
+// 命中即按文件名前缀映射回档位并构建解密流。
+func (r *StreamResolver) resolveEncryptedBatch(ctx context.Context, mid, mediaMid string, target *Tier) (*ResolvedStream, error) {
+	variants := make([]modules.EVkeyVariant, 0, len(tierTable))
+	byPrefix := map[string]*Tier{}
+	for _, t := range tierTable {
+		if t.Rank > target.Rank || t.EncPref == "" {
+			continue
+		}
+		variants = append(variants, modules.EVkeyVariant{Pref: t.EncPref, Ext: t.EncExt})
+		byPrefix[t.EncPref] = t
+	}
+	if len(variants) == 0 {
+		return nil, errProvider("无可用的加密变体")
+	}
+	entries, err := r.provider.song.GetEVkeyBatch(mid, mediaMid, variants)
+	if err != nil {
+		return nil, errProvider(fmt.Sprintf("EVkey 批量取链失败: %v", err))
+	}
+	for _, e := range entries {
+		if e.Result != 0 || e.Purl == "" || e.Ekey == "" {
+			continue
+		}
+		tier := byPrefix[prefixOf(e.Filename, byPrefix)]
+		if tier == nil {
+			continue
+		}
+		cipher, cerr := qmc.NewCipherFromEkey(e.Ekey)
+		if cerr != nil {
+			continue // ekey 不可用（过期/格式变化）
+		}
+		if r.probePlain && !r.sniffDecryptedOK(ctx, r.provider.streamURL(ctx, e.Purl), cipher) {
+			continue // 解密后仍非明文容器（ekey 不匹配）
+		}
+		return &ResolvedStream{
+			Mid: mid, Tier: tier, RequestedTier: target,
+			URL:      r.provider.streamURL(ctx, e.Purl),
+			Filename: e.Filename,
+			Encrypted: true, Cipher: cipher,
+			Degraded: tier != target,
+		}, nil
+	}
+	return nil, errProvider("EVkey 批量无可播条目")
+}
+
+// prefixOf 从文件名提取加密前缀（文件名形如 F0M0<media_mid>.mflac，前缀定长 4）。
+func prefixOf(filename string, byPrefix map[string]*Tier) string {
+	if len(filename) >= 4 {
+		if _, ok := byPrefix[filename[:4]]; ok {
+			return filename[:4]
+		}
+	}
+	return filename
 }
 
 func plainType(t *Tier) *modules.SongFileType {

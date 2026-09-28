@@ -84,7 +84,7 @@ func (a *App) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeSearch(raw))
 }
 
 func (a *App) handleSearchGeneral(w http.ResponseWriter, r *http.Request) {
@@ -160,7 +160,7 @@ func (a *App) handleRecommendSonglist(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeRecommendSonglists(raw))
 }
 
 func (a *App) handleRecommendNewsong(w http.ResponseWriter, r *http.Request) {
@@ -172,7 +172,7 @@ func (a *App) handleRecommendNewsong(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeNewsong(raw))
 }
 
 // dailyDirid 「每日30首」= 系统虚拟歌单，dirid 固定 202（与「我喜欢」= 201 同一族）：
@@ -192,7 +192,7 @@ func (a *App) handleRecommendDaily(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeSonglistDetail(raw))
 }
 
 func (a *App) handleTopCategory(w http.ResponseWriter, _ *http.Request) {
@@ -230,7 +230,7 @@ func (a *App) handleAlbumDetail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeAlbumDetail(raw))
 }
 
 func (a *App) handleAlbumSongs(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +244,7 @@ func (a *App) handleAlbumSongs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeAlbumSongs(raw))
 }
 
 func (a *App) handleSingerInfo(w http.ResponseWriter, r *http.Request) {
@@ -256,7 +256,7 @@ func (a *App) handleSingerInfo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeHomepageBaseInfo(raw))
 }
 
 func (a *App) handleSingerSongs(w http.ResponseWriter, r *http.Request) {
@@ -273,7 +273,7 @@ func (a *App) handleSingerSongs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeSingerSongs(raw))
 }
 
 func (a *App) handleSingerAlbums(w http.ResponseWriter, r *http.Request) {
@@ -287,7 +287,7 @@ func (a *App) handleSingerAlbums(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeSingerAlbums(raw))
 }
 
 func (a *App) handleSingerSimilar(w http.ResponseWriter, r *http.Request) {

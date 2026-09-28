@@ -309,6 +309,9 @@ func (a *App) startMobileQRConsumer(identifier string) {
 			state.mu.Lock()
 			state.event = qrEventNum(result.Event)
 			state.done = result.Done
+			if result.Error != "" {
+				state.error = result.Error
+			}
 			if result.Done && result.Credential != nil {
 				a.session.Adopt(result.Credential)
 				state.credential = jsonableCredential(result.Credential)

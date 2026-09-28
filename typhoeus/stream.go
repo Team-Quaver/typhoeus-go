@@ -181,11 +181,14 @@ func ProbeTotal(ctx context.Context, url string) (int64, error) {
 func CopyRange(ctx context.Context, w io.Writer, url string, first *UpstreamResponse,
 	cipher qmc.Cipher, start, end int64, totalKnown bool, resume int) error {
 
+	// pos 必须跨次重试累加：pump 返回本次实际写出的字节数，
+	// 否则续传会从原始起点重发（响应字节数超过声明的 Content-Length，流直接损坏）。
 	pos := start
 	resp := first
 	left := resume
 	for {
-		err := pump(ctx, w, resp.Body, pos, cipher)
+		written, err := pump(ctx, w, resp.Body, pos, cipher)
+		pos += written
 		if err == nil {
 			// 正常收尾：定长响应被截断时 net/http 只静默 EOF，必须靠 pos 比对发现
 			if !totalKnown || end < 0 || pos > end {
@@ -212,12 +215,13 @@ func CopyRange(ctx context.Context, w io.Writer, url string, first *UpstreamResp
 }
 
 // pump 从 body 逐块读取，按绝对偏移解密（cipher 非 nil）后写入 w。
-func pump(ctx context.Context, w io.Writer, body io.Reader, startPos int64, cipher qmc.Cipher) error {
+// 返回本次实际写出的字节数（供续传推进绝对偏移）。
+func pump(ctx context.Context, w io.Writer, body io.Reader, startPos int64, cipher qmc.Cipher) (int64, error) {
 	buf := make([]byte, chunkSize)
 	pos := startPos
 	for {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return pos - startPos, ctx.Err()
 		}
 		n, rerr := body.Read(buf)
 		if n > 0 {
@@ -226,15 +230,15 @@ func pump(ctx context.Context, w io.Writer, body io.Reader, startPos int64, ciph
 				chunk = cipher.Decrypt(chunk, pos)
 			}
 			if _, werr := w.Write(chunk); werr != nil {
-				return werr // 客户端断开：直接返回
+				return pos - startPos, werr // 客户端断开：直接返回
 			}
 			pos += int64(n)
 		}
 		if rerr == io.EOF {
-			return nil
+			return pos - startPos, nil
 		}
 		if rerr != nil {
-			return rerr
+			return pos - startPos, rerr
 		}
 	}
 }

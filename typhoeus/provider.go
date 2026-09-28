@@ -108,8 +108,22 @@ func (p *QQMusicProvider) fetchMembership(ctx context.Context) Membership {
 
 // resolveLinks 取链（明文/加密通道按 fileType 前缀自动路由）。
 func (p *QQMusicProvider) resolveLinks(ctx context.Context, mid, mediaMid string, ft modules.SongFileType) ([]LinkResult, error) {
-	files := []modules.SongFileInfo{{Mid: mid, MediaMid: mediaMid, FileType: &ft}}
-	raw, err := p.song.GetSongURLs(files, ft, qqmusic.CGIOption{})
+	return p.resolveLinksPlatform(ctx, mid, mediaMid, ft, "", 0)
+}
+
+// resolveLinksPlatform 同上，但允许指定请求平台身份（android/web/desktop）。
+// 上游对不同平台 + 凭证家族（wx/QQ 登录）的版权判定不同——严格曲库（日本 VOCALOID、
+// 周杰伦等）在 android 身份下会被 104003/101404 拒，web/desktop 身份可能放行。
+func (p *QQMusicProvider) resolveLinksPlatform(ctx context.Context, mid, mediaMid string, ft modules.SongFileType, platform string, songType int) ([]LinkResult, error) {
+	// songtype 语义（对齐 amtoaer/lyrune）：上游搜索项 type==1（普通歌曲）映射为 0，
+	// 其余类型原样透传；EVkey 加密通道则固定 1（见 modules.GetEVkeyBatch / GetSongURLs）。
+	// 搞反会导致严格曲库高档位判定异常。
+	if songType == 1 {
+		songType = 0
+	}
+	files := []modules.SongFileInfo{{Mid: mid, MediaMid: mediaMid, FileType: &ft, SongType: songType}}
+	opt := qqmusic.CGIOption{Platform: modules.NormalizePlatform(platform)}
+	raw, err := p.song.GetSongURLs(files, ft, opt)
 	if err != nil {
 		return nil, errProvider(fmt.Sprintf("取链失败: %v", err))
 	}
@@ -194,4 +208,10 @@ func normalizeDomain(domain string) string {
 		domain += "/"
 	}
 	return domain
+}
+
+// streamURL 拼接 CDN 域名与 purl（dispatch 失败时用兜底域名）。
+func (p *QQMusicProvider) streamURL(ctx context.Context, purl string) string {
+	domain, _ := p.cdnDomain(ctx)
+	return domain + purl
 }

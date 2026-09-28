@@ -78,7 +78,7 @@ func (a *App) handleUserLiked(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeSonglistDetail(raw))
 }
 
 func (a *App) handleUserCreatedSonglists(w http.ResponseWriter, _ *http.Request) {
@@ -94,7 +94,7 @@ func (a *App) handleUserCreatedSonglists(w http.ResponseWriter, _ *http.Request)
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeCreatedSonglists(raw))
 }
 
 func (a *App) handleUserFavSonglists(w http.ResponseWriter, r *http.Request) {
@@ -112,7 +112,7 @@ func (a *App) handleUserFavSonglists(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeFavSonglists(raw))
 }
 
 // ===================== 歌曲 =====================
@@ -305,7 +305,7 @@ func (a *App) handleSongLyric(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeLyric(raw))
 }
 
 func (a *App) handleSongComments(w http.ResponseWriter, r *http.Request) {
@@ -382,7 +382,7 @@ func (a *App) handleSonglistDetail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeSonglistDetail(raw))
 }
 
 func (a *App) handleSonglistLike(w http.ResponseWriter, r *http.Request) {
