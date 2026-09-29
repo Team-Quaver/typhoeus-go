@@ -151,6 +151,11 @@ var (
 	qqArgsRe   = regexp.MustCompile(`'((?:\\.|[^'])*)'`)
 	qqSigxRe   = regexp.MustCompile(`(?:\?|&)ptsigx=(.+?)&s_url`)
 	qqUinRe    = regexp.MustCompile(`(?:\?|&)uin=(.+?)&service`)
+	// oauth authorize 的 302 Location 里提取 code。注意 Go regexp 是 RE2：
+	// 不支持 lookbehind/lookahead（Python 移植来的 (?<=code=)...(?=&) 会在
+	// MustCompile 时直接 panic —— 手机确认后 authorize 每请求必炸，前端只看到
+	// 「确认了没反应」），改用捕获组。
+	qqCodeRe = regexp.MustCompile(`[?&]code=([^&]+)`)
 )
 
 // CheckQQQR 轮询 QQ 二维码状态。
@@ -253,7 +258,7 @@ func (m *LoginModule) authorizeQQQR(ctx context.Context, uin, sigx string) (*qqm
 		return nil, err
 	}
 	location := authResp.Headers.Get("Location")
-	codeMatch := regexp.MustCompile(`(?<=code=)(.+?)(?=&)`).FindStringSubmatch(location)
+	codeMatch := qqCodeRe.FindStringSubmatch(location)
 	if codeMatch == nil {
 		return nil, qqmusic.NewDataError("获取 code 失败")
 	}
