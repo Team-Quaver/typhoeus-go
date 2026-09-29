@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,7 @@ func (p *QQMusicProvider) Membership(ctx context.Context) Membership {
 	level := p.fetchMembership(ctx)
 	p.membership = level
 	p.membershipAt = now
+	logf("membership 判定: %s", level)
 	return level
 }
 
@@ -79,11 +81,13 @@ func (p *QQMusicProvider) Membership(ctx context.Context) Membership {
 // 区分「未登录」与「登录但非会员」：未登录直接 0，省一次必然失败的请求。
 func (p *QQMusicProvider) fetchMembership(ctx context.Context) Membership {
 	if !p.cl.Credential().HasLogin() {
+		logf("membership: 未登录，判普通用户")
 		return MembershipNone
 	}
 	raw, err := p.user.GetVipInfo()
 	if err != nil {
 		// 拿不到会员信息按最低门槛处理：档位请求仍可能成功（免费曲可播低档）
+		logf("membership: GetVipInfo 失败，按最低门槛处理: %v", err)
 		return MembershipNone
 	}
 	var vip struct {
@@ -95,6 +99,7 @@ func (p *QQMusicProvider) fetchMembership(ctx context.Context) Membership {
 		} `json:"identity"`
 	}
 	if err := json.Unmarshal(raw, &vip); err != nil {
+		logf("membership: 响应解析失败，按最低门槛处理")
 		return MembershipNone
 	}
 	if vip.Svip != 0 {
@@ -103,7 +108,25 @@ func (p *QQMusicProvider) fetchMembership(ctx context.Context) Membership {
 	if vip.HugeVip != 0 || vip.Identity.HugeVip != 0 || vip.Identity.Vip != 0 {
 		return MembershipGreen
 	}
+	// 全零诊断：上游这条 CGI 的字段命名风格不稳定（snake_case/驼峰混用），
+	// 键名不匹配时 Go 的 json 会静默读零 → 判普通用户 → 高阶全被本地门控拦掉。
+	// 打出顶层键名供对风格（键名非敏感值）。
+	logf("membership: 响应无任何会员标记，判普通用户（顶层键: %s）", topKeys(raw))
 	return MembershipNone
+}
+
+// topKeys 响应顶层键名（诊断用；解析失败返回 "?"）。
+func topKeys(raw json.RawMessage) string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return "?"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
 }
 
 // resolveLinks 取链（明文/加密通道按 fileType 前缀自动路由）。

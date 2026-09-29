@@ -187,8 +187,9 @@ func TestTeaCBCRoundtrip(t *testing.T) {
 	}
 }
 
-// crossVectors 与 /tmp 下的 Python 对拍脚本（tools/gen_qmc_vectors.py）配套：
+// crossVectors 与 tools/gen_qmc_vectors.py（参考实现 tools/qmc_ref.py）配套：
 // 用参考实现生成随机主密钥的 EKey + 密文片段，验证 Go 全链路与参考一致。
+// 包内固化 qmc/vectors.json（20260928 种子）；外部向量可用 QMC_CROSS_VECTORS 覆盖。
 type crossVectors struct {
 	Ekey    string `json:"ekey"`
 	Master  string `json:"master"` // hex
@@ -200,7 +201,9 @@ type crossVectors struct {
 func TestCrossVectors(t *testing.T) {
 	path := os.Getenv("QMC_CROSS_VECTORS")
 	if path == "" {
-		t.Skip("未设置 QMC_CROSS_VECTORS（可选：Python 对拍向量）")
+		// 包内固化向量（tools/gen_qmc_vectors.py 生成，unlock-music 语义参考实现
+		// tools/qmc_ref.py 构造）；env 可指向外部更新的向量文件覆盖。
+		path = "vectors.json"
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {

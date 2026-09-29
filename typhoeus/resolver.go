@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/team-quaver/typhoeus-go/qmc"
 	"github.com/team-quaver/typhoeus-go/qqmusic/modules"
@@ -69,7 +70,7 @@ func (r *StreamResolver) Resolve(ctx context.Context, mid, mediaMid, tierID stri
 		}
 		// 1) 明文形态
 		if tier.hasPlain() {
-			links, err := r.provider.resolveLinksPlatform(ctx, mid, mediaMid, *plainType(tier), platform, songType)
+			links, err := r.fetchLinksForTier(ctx, mid, mediaMid, plainType(tier), platform, songType)
 			if err != nil {
 				return nil, err
 			}
@@ -88,7 +89,7 @@ func (r *StreamResolver) Resolve(ctx context.Context, mid, mediaMid, tierID stri
 		}
 		// 2) 加密形态（需 ekey；解密器仅驻内存）
 		if tier.hasEnc() {
-			links, err := r.provider.resolveLinksPlatform(ctx, mid, mediaMid, *encType(tier), platform, songType)
+			links, err := r.fetchLinksForTier(ctx, mid, mediaMid, encType(tier), platform, songType)
 			if err != nil {
 				return nil, err
 			}
@@ -206,22 +207,87 @@ func pickLink(links []LinkResult, mid string) *LinkResult {
 	return nil
 }
 
+// sniffTimeout 单次嗅探/探测请求的预算。resolve 全链路必须快于前端 12s 超时；
+// 此前无超时，CDN 挂起会把整次 resolve 拖到前端兜底标准音质（高阶「莫名消失」的
+// 真实回归源之一）。
+const sniffTimeout = 5 * time.Second
+
+// strictRejection 严格曲库的平台性拒绝：android 身份下日本 VOCALOID、周杰伦等
+// 会被拒，web/desktop 身份可能放行（版权判定按平台独立）。
+func strictRejection(code int64) bool {
+	return code == 104003 || code == 101404
+}
+
+// fetchLinksForTier 取链（带平台回退）：缺省 android 身份被严格曲库拒绝时，
+// 换 web 身份重试一次。只在调用方未显式指定平台时回退（显式指定则尊重意图）。
+func (r *StreamResolver) fetchLinksForTier(ctx context.Context, mid, mediaMid string,
+	ft *modules.SongFileType, platform string, songType int) ([]LinkResult, error) {
+
+	links, err := r.provider.resolveLinksPlatform(ctx, mid, mediaMid, *ft, platform, songType)
+	if err != nil {
+		return nil, err
+	}
+	if platform != "" {
+		return links, nil
+	}
+	if hit := pickLink(links, mid); hit != nil {
+		return links, nil
+	}
+	if len(links) > 0 && strictRejection(links[0].ResultCode) {
+		retry, rerr := r.provider.resolveLinksPlatform(ctx, mid, mediaMid, *ft, "web", songType)
+		if rerr == nil && pickLink(retry, mid) != nil {
+			logf("档位 %s：android 被拒(result=%d)，web 身份放行", ft.Name, links[0].ResultCode)
+			return retry, nil
+		}
+	}
+	return links, nil
+}
+
 // sniffDirectOK 明文直连嗅探：取首 16 字节验容器 magic。
+//
+// 网络失败 ≠ 内容不符：CDN 抖动一次就静默降档是真实回归源（高阶莫名变标准），
+// 因此重试一次后仍连不上就放行该档——上游给的本就是该档资源的授权 URL，
+// magic 白名单防的是「上游偶发回密文」这种确定性问题，不是网络抖动。
 func (r *StreamResolver) sniffDirectOK(ctx context.Context, url string) bool {
+	ok, netFail := sniffDirect(ctx, url)
+	if netFail {
+		ok, netFail = sniffDirect(ctx, url)
+	}
+	if netFail {
+		logf("明文嗅探网络失败（重试后仍失败），放行该档")
+		return true
+	}
+	return ok
+}
+
+func sniffDirect(ctx context.Context, url string) (ok, netFail bool) {
 	head, _, err := fetchRange(ctx, url, 0, 15)
 	if err != nil {
-		return false
+		return false, true
 	}
-	return LooksPlain(head)
+	return LooksPlain(head), false
 }
 
 // sniffDecryptedOK 加密流嗅探：解密首 16 字节后验 magic（验证 ekey 正确性）。
+// 与明文嗅探同理：网络失败重试一次后放行；magic 不符（ekey 真不匹配）才降档。
 func (r *StreamResolver) sniffDecryptedOK(ctx context.Context, url string, cipher qmc.Cipher) bool {
+	ok, netFail := sniffDecrypted(ctx, url, cipher)
+	if netFail {
+		ok, netFail = sniffDecrypted(ctx, url, cipher)
+	}
+	if netFail {
+		logf("加密嗅探网络失败（重试后仍失败），放行该档")
+		return true
+	}
+	return ok
+}
+
+func sniffDecrypted(ctx context.Context, url string, cipher qmc.Cipher) (ok, netFail bool) {
 	head, _, err := fetchRange(ctx, url, 0, 15)
 	if err != nil {
-		return false
+		return false, true
 	}
-	return SniffPlain(cipher, head)
+	return SniffPlain(cipher, head), false
 }
 
 // gateReason 门控拒绝文案（与上游一致）。
@@ -233,7 +299,10 @@ func gateReason(m Membership, tier *Tier) string {
 }
 
 // fetchRange 拉取 [start,end] 闭区间的字节（嗅探/取总长用，小数据量）。
+// 带单次超时：resolve 是同步链路，单点挂起不能拖垮整次协商。
 func fetchRange(ctx context.Context, url string, start, end int64) ([]byte, int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, sniffTimeout)
+	defer cancel()
 	resp, err := OpenRange(ctx, url, &ByteRange{Start: &start, End: &end})
 	if err != nil {
 		return nil, 0, err

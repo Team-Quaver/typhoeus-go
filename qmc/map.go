@@ -37,6 +37,15 @@ func mapByteAt(key *[v1KeySize]byte, value byte, offset int64) byte {
 // mapTransform 对 data（绝对起点 offset）整段做静态映射变换，返回新切片。
 func mapTransform(data []byte, offset int64, key *[v1KeySize]byte) []byte {
 	out := make([]byte, len(data))
+	copy(out, data)
+	xorMapInPlace(out, offset, doubleKey(key))
+	return out
+}
+
+// xorMapInPlace 就地异或：分段处理 0x7FFF 边界（两侧取模语义不同，不能合并），
+// 段内用 256 字节双表线性异或——phase ∈ [0,128)、take ≤ 128 ⇒ phase+take ≤ 254，
+// 永不越界，消掉逐字节的 %128。
+func xorMapInPlace(data []byte, offset int64, key2 *[2 * v1KeySize]byte) {
 	pos := offset
 	for i := 0; i < len(data); {
 		var take int
@@ -52,13 +61,24 @@ func mapTransform(data []byte, offset int64, key *[v1KeySize]byte) []byte {
 			take = min(int(v1OffsetBoundary-r), len(data)-i)
 			phase = r % v1KeySize
 		}
-		for j := 0; j < take; j++ {
-			out[i+j] = data[i+j] ^ key[(phase+int64(j))%v1KeySize]
+		// 双表线性异或的窗口上限：一个回绕周期（128-phase），回绕交给下一轮
+		take = min(take, v1KeySize-int(phase))
+		buf := data[i : i+take]
+		ks := key2[phase : phase+int64(take)]
+		for j := range buf {
+			buf[j] ^= ks[j]
 		}
 		i += take
 		pos += int64(take)
 	}
-	return out
+}
+
+// doubleKey 由 128 字节映射密钥生成段内线性查表用的双表（key||key）。
+func doubleKey(key *[v1KeySize]byte) *[2 * v1KeySize]byte {
+	var k2 [2 * v1KeySize]byte
+	copy(k2[:], key[:])
+	copy(k2[v1KeySize:], key[:])
+	return &k2
 }
 
 // key_compress 对应 Rust v2_map/key.rs：任意长度主密钥压缩成 128 字节映射密钥。
@@ -77,7 +97,8 @@ func keyCompress(longKey []byte) [v1KeySize]byte {
 
 // MapCipher QMCv2 短密钥（1..300 字节）Map 流密码。
 type MapCipher struct {
-	key [v1KeySize]byte
+	key  [v1KeySize]byte
+	key2 *[2 * v1KeySize]byte // 双表（key||key）：段内线性异或，构造时预生成
 }
 
 // NewMapCipher 由主密钥构造 Map 密码。
@@ -85,7 +106,8 @@ func NewMapCipher(masterKey []byte) (*MapCipher, error) {
 	if len(masterKey) == 0 {
 		return nil, ErrEmptyKey
 	}
-	return &MapCipher{key: keyCompress(masterKey)}, nil
+	key := keyCompress(masterKey)
+	return &MapCipher{key: key, key2: doubleKey(&key)}, nil
 }
 
 // Decrypt 解密 data（对应密文在文件中的绝对偏移 offset），返回新切片。

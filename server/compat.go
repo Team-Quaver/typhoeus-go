@@ -293,13 +293,30 @@ func normalizeSingerSongs(raw json.RawMessage) obj {
 	}
 }
 
-// —— 歌手专辑（SingerAlbumListResponse：album_list←albumList）——
+// —— 歌手专辑（GetAlbumListResponse：album_list←albumList[*] 平铺驼峰）——
+// 上游每项直接是 albumMid/albumName/pmid/albumType/publishDate（驼峰平铺，
+// 不是专辑详情那种 basicInfo 包一层）。此前原样透传，前端读 snake_case 全空：
+// 专辑名恒为占位符「专辑」、点进详情缺 mid。逐项归一化成前端 AlbumBrief 形状。
 func normalizeSingerAlbums(raw json.RawMessage) obj {
 	d := decodeObj(raw)
+	list := arr{}
+	for _, it := range arrOf(d, "albumList") {
+		al := asObj(it)
+		list = append(list, obj{
+			"mid":         strOf(al, "albumMid", "mid"),
+			"pmid":        strOf(al, "pmid"),
+			"name":        strOf(al, "albumName", "name"),
+			"tran_name":   strOf(al, "albumTranName"),
+			"album_type":  strOf(al, "albumType", "album_type"),
+			"time_public": strOf(al, "publishDate", "time_public"),
+			"singer_name": strOf(al, "singerName"),
+			"total_num":   numOf(al, "totalNum"),
+		})
+	}
 	return obj{
 		"singer_mid": strOf(d, "singerMid", "singer_mid"),
 		"total":      numOf(d, "total"),
-		"album_list": orArr(d["albumList"]),
+		"album_list": list,
 	}
 }
 
@@ -388,6 +405,99 @@ func normalizeLyric(raw json.RawMessage) obj {
 		"qrc":             d["qrc"],
 	}
 	return out
+}
+
+// —— VIP 信息（UserVipInfoResponse：identity / userinfo 两层嵌套）——
+//
+// 上游这条 CGI 的字段命名风格不稳定：同一份语义在不同账号/版本下既有 snake_case
+// （huge_vip_end，2026-09-19 抓包实测）、也有驼峰/小写连写（HugeVipEnd、starend、
+// canRenew —— QQMusicApi Python SDK 的 validation_alias 链即为此而设）。
+// Py 后端当年靠 pydantic 模型 dump 成稳定形状；这里沿用 SDK 的别名链做归一化，
+// 前端 ui/src/lib/vip.ts 按 snake_case 挑字段，名字错了不会报错、只会静默少一行。
+//
+// 与其他 normalize 一样按 SDK dump 形状重建输出：别名链按序取第一个**存在**的键，
+// 值原样搬运（时间串/数字/URL 都不做类型改写）；嵌套块缺失时补空对象（对应
+// pydantic 的 default_factory），未知键按 SDK 形状丢弃。
+func normalizeVip(raw json.RawMessage) obj {
+	d := decodeObj(raw)
+	out := obj{}
+
+	// 顶层（UserVipInfoResponse）：svip/star 等无别名的字段直接保留
+	for _, k := range []string{"svip", "star", "ystar", "identity", "userinfo"} {
+		if v, ok := d[k]; ok && v != nil {
+			out[k] = v
+		}
+	}
+	pick(&out, d,
+		[]string{"auto_down", "auto_down", "autoDown", "autodown"},
+		[]string{"can_renew", "can_renew", "canRenew"},
+		[]string{"max_dir_num", "max_dir_num", "maxDirNum", "maxdirnum"},
+		[]string{"max_song_num", "max_song_num", "maxSongNum", "maxsongnum"},
+		[]string{"song_limit_msg", "song_limit_msg", "songLimitMsg"},
+		[]string{"star_start", "star_start", "starstart"},
+		[]string{"star_end", "star_end", "starend"},
+		[]string{"ystar_start", "ystar_start", "ystarstart"},
+		[]string{"ystar_end", "ystar_end", "ystarend"},
+	)
+
+	// identity（VipIdentity）：会员身份明细（徽章档位 + 等级 + 协议档位）。
+	// huge_vip 系/year_flag 没有别名歧义，走下方别名链（小写优先）统一搬运。
+	id := objOf(d, "identity")
+	nid := obj{}
+	for _, k := range []string{"vip", "twelve", "eight", "level", "icon"} {
+		if v, ok := id[k]; ok && v != nil {
+			nid[k] = v
+		}
+	}
+	pick(&nid, id,
+		[]string{"huge_vip", "huge_vip", "HugeVip"},
+		[]string{"huge_vip_start", "huge_vip_start", "HugeVipStart"},
+		[]string{"huge_vip_end", "huge_vip_end", "HugeVipEnd"},
+		[]string{"huge_year_flag", "huge_year_flag", "HugeYearFlag"},
+		[]string{"year_flag", "year_flag", "yearflag"},
+		[]string{"twelve_start", "twelve_start", "twelveStart"},
+		[]string{"twelve_end", "twelve_end", "twelveEnd"},
+		[]string{"child_vip", "child_vip", "ChildVip"},
+		[]string{"exp_vip", "exp_vip", "ExpVip"},
+		[]string{"group_vip_flag", "group_vip_flag", "GroupVipFlag"},
+		[]string{"group_vip_start", "group_vip_start", "GroupVipStart"},
+		[]string{"group_vip_end", "group_vip_end", "GroupVipEnd"},
+		[]string{"cp_lover_flag", "cp_lover_flag", "CPLoverFlag"},
+		[]string{"cp_lover_start", "cp_lover_start", "CPLoverStart"},
+		[]string{"cp_lover_end", "cp_lover_end", "CPLoverEnd"},
+		[]string{"ad_vip_flag", "ad_vip_flag", "AdVipFlag"},
+		[]string{"eight_start", "eight_start", "eightStart"},
+		[]string{"eight_end", "eight_end", "eightEnd"},
+		[]string{"next_level", "next_level", "nextlevel"},
+		[]string{"purchase_url", "purchase_url", "purchaseUrl"},
+	)
+	out["identity"] = nid
+
+	// userinfo（VipUserInfo）：权益摘要（expire 是前端「会员有效至」的兜底字段）
+	ui := objOf(d, "userinfo")
+	nui := obj{}
+	for _, k := range []string{"score", "expire"} {
+		if v, ok := ui[k]; ok && v != nil {
+			nui[k] = v
+		}
+	}
+	pick(&nui, ui,
+		[]string{"buy_url", "buy_url", "buyurl"},
+		[]string{"my_vip_url", "my_vip_url", "myvipurl"},
+		[]string{"music_level", "music_level"},
+	)
+	out["userinfo"] = nui
+
+	return out
+}
+
+// pick 按 (输出名, 别名链…) 组从 src 搬运第一个存在的键值到 dst。
+func pick(dst *obj, src obj, groups ...[]string) {
+	for _, g := range groups {
+		if v := firstOf(src, g[1:]...); v != nil {
+			(*dst)[g[0]] = v
+		}
+	}
 }
 
 // decodeLyricField 解密歌词字段；解不开保留原值（与 SDK 的 suppress 语义一致）。

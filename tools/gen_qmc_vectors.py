@@ -9,9 +9,10 @@ import base64
 import json
 import random
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "/tmp/qmc-ref")
-import mzj  # noqa: E402  参考实现（unlock-music 对拍移植）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import qmc_ref as mzj  # noqa: E402  参考实现（unlock-music 对拍移植，tools/qmc_ref.py）
 
 
 def rand_bytes(rng, n):

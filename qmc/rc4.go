@@ -97,28 +97,33 @@ func NewRC4Cipher(masterKey []byte) (*RC4Cipher, error) {
 func (c *RC4Cipher) Decrypt(data []byte, offset int64) []byte {
 	out := make([]byte, len(data))
 	copy(out, data)
-	n := len(out)
+	c.decryptRC4(out, offset)
+	return out
+}
+
+// decryptRC4 就地解密 buf（绝对起点 offset）。Decrypt 与 DecryptInPlace 共用。
+func (c *RC4Cipher) decryptRC4(buf []byte, offset int64) {
+	n := len(buf)
 	pos := offset
 	start := 0
 	if pos < rc4FirstSegmentSize {
 		take := min(int(rc4FirstSegmentSize-pos), n-start)
-		c.xorFirstSegment(out[start:start+take], pos)
+		c.xorFirstSegment(buf[start:start+take], pos)
 		start += take
 		pos += int64(take)
 	}
 	if rem := pos % rc4OtherSegmentSize; rem != 0 {
 		take := min(int(rc4OtherSegmentSize-rem), n-start)
-		c.xorOtherSegment(out[start:start+take], pos)
+		c.xorOtherSegment(buf[start:start+take], pos)
 		start += take
 		pos += int64(take)
 	}
 	for start < n {
 		take := min(rc4OtherSegmentSize, n-start)
-		c.xorOtherSegment(out[start:start+take], pos)
+		c.xorOtherSegment(buf[start:start+take], pos)
 		start += take
 		pos += int64(take)
 	}
-	return out
 }
 
 // xorFirstSegment 首段（0x80 字节内）：逐字节独立取 key 索引。
@@ -132,13 +137,16 @@ func (c *RC4Cipher) xorFirstSegment(buf []byte, offset int64) {
 }
 
 // xorOtherSegment 其余段：段内用 keyStream 的连续切片异或。
+// keystream 连续区先切片再逐字节异或（len ≤ 0x1400，skip+off+len ≤ 0x1600 缓存上界），
+// 边界检查只做一次；skip 恒 < 512（&0x1FF 保证），切片永不出界。
 func (c *RC4Cipher) xorOtherSegment(buf []byte, offset int64) {
 	n := len(c.key)
 	segID := offset / rc4OtherSegmentSize
 	blockOff := int(offset % rc4OtherSegmentSize)
 	seed := c.key[int(segID)%n]
 	skip := int(getSegmentKey(segID, seed, c.hash)) & 0x1FF
+	ks := c.keyStream[skip+blockOff : skip+blockOff+len(buf)]
 	for j := range buf {
-		buf[j] ^= c.keyStream[skip+blockOff+j]
+		buf[j] ^= ks[j]
 	}
 }

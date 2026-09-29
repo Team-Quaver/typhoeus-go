@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/team-quaver/typhoeus-go/qmc"
@@ -173,13 +174,14 @@ func ProbeTotal(ctx context.Context, url string) (int64, error) {
 	return total, err
 }
 
-// CopyRange 把上游响应流按需解密后写到 w。
+// CopyRange 把上游响应流按需解密后写到 w，返回本次实际写出的字节数
+// （供调用方区分「播放器良性 abort（几乎没发数据）」与「大量传输后真故障」）。
 //
 // resume=0 表示不续传（后缀 Range 且总长未知时无从推导偏移）；
 // cipher 非 nil 时按「绝对偏移」逐块解密——块边界与网络分片无关，
 // 任意重连位置都能无缝续解。
 func CopyRange(ctx context.Context, w io.Writer, url string, first *UpstreamResponse,
-	cipher qmc.Cipher, start, end int64, totalKnown bool, resume int) error {
+	cipher qmc.Cipher, start, end int64, totalKnown bool, resume int) (int64, error) {
 
 	// pos 必须跨次重试累加：pump 返回本次实际写出的字节数，
 	// 否则续传会从原始起点重发（响应字节数超过声明的 Content-Length，流直接损坏）。
@@ -187,28 +189,28 @@ func CopyRange(ctx context.Context, w io.Writer, url string, first *UpstreamResp
 	resp := first
 	left := resume
 	for {
-		written, err := pump(ctx, w, resp.Body, pos, cipher)
-		pos += written
+		n, err := pump(ctx, w, resp.Body, pos, cipher)
+		pos += n
 		if err == nil {
 			// 正常收尾：定长响应被截断时 net/http 只静默 EOF，必须靠 pos 比对发现
 			if !totalKnown || end < 0 || pos > end {
-				return nil
+				return pos - start, nil
 			}
 			err = errStream(fmt.Sprintf("回源提前 EOF（已发 %d 字节）", pos))
 		}
 		// 已发完本段就不关后面的事
 		if totalKnown && end >= 0 && pos > end {
-			return nil
+			return pos - start, nil
 		}
 		if left <= 0 {
-			return err
+			return pos - start, err
 		}
 		left--
 		time.Sleep(resumeBackoff)
 		resp.Body.Close()
 		next, rerr := reopenAt(ctx, url, pos)
 		if rerr != nil {
-			return err // 续传失败，报原始错误
+			return pos - start, err // 续传失败，报原始错误
 		}
 		resp = next
 	}
@@ -216,8 +218,15 @@ func CopyRange(ctx context.Context, w io.Writer, url string, first *UpstreamResp
 
 // pump 从 body 逐块读取，按绝对偏移解密（cipher 非 nil）后写入 w。
 // 返回本次实际写出的字节数（供续传推进绝对偏移）。
+//
+// 缓冲策略：chunk 从 sync.Pool 取（稳态零分配）；cipher 支持 InPlaceCipher
+// 时在复用缓冲上就地解密，旧式 Decrypt（返回新切片）作为兜底路径保留。
 func pump(ctx context.Context, w io.Writer, body io.Reader, startPos int64, cipher qmc.Cipher) (int64, error) {
-	buf := make([]byte, chunkSize)
+	bufp := pumpBufPool.Get().([]byte)
+	defer pumpBufPool.Put(bufp)
+	buf := bufp[:chunkSize]
+
+	inplace, _ := cipher.(qmc.InPlaceCipher)
 	pos := startPos
 	for {
 		if ctx.Err() != nil {
@@ -226,7 +235,10 @@ func pump(ctx context.Context, w io.Writer, body io.Reader, startPos int64, ciph
 		n, rerr := body.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
-			if cipher != nil {
+			switch {
+			case inplace != nil:
+				inplace.DecryptInPlace(chunk, pos)
+			case cipher != nil:
 				chunk = cipher.Decrypt(chunk, pos)
 			}
 			if _, werr := w.Write(chunk); werr != nil {
@@ -241,6 +253,12 @@ func pump(ctx context.Context, w io.Writer, body io.Reader, startPos int64, ciph
 			return pos - startPos, rerr
 		}
 	}
+}
+
+// pumpBufPool 中继读缓冲池：256KB 块对高码率 FLAC/母带流意味着稳态下
+// 每秒数次的大块分配；池化 + 就地解密后热路径零分配（GC 不再跟着播放抖）。
+var pumpBufPool = sync.Pool{
+	New: func() any { return make([]byte, chunkSize) },
 }
 
 // reopenAt 从 pos 重开一段（上游不认 Range 时宁可放弃也不重发字节）。

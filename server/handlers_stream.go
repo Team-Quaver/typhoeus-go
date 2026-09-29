@@ -132,11 +132,13 @@ func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	// 探测总长：对 CDN 发 bytes=0-0，从 Content-Range 解析（不下载实体）
+	// 探测总长：对 CDN 发 bytes=0-0，从 Content-Range 解析（不下载实体）。
+	// CDN 抖动不该推翻已协商成功的流：total 未知时中继按流式透传照样可播
+	// （此前探测失败会让整次 resolve 报错 → 前端兜底标准音质）。
 	total, err := typhoeus.ProbeTotal(r.Context(), resolved.URL)
 	if err != nil {
-		writeError(w, err)
-		return
+		logWarn("探测总长失败（按未知长度继续）: %v", err)
+		total = 0
 	}
 	a.purgeExpired()
 	token := newToken()
@@ -239,12 +241,12 @@ func (a *App) handleStreamProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 断流续传：CDN 掐连接/读超时把「播放中断」降级为「一次短暂停顿」。
-	err = typhoeus.CopyRange(r.Context(), discardLogger{w}, entry.url, up,
+	written, err := typhoeus.CopyRange(r.Context(), discardLogger{w}, entry.url, up,
 		entry.cipher, start, end, entry.total > 0, resume)
 	if err != nil {
-		// 续传也救不回来时（CDN 持续掐）不刷栈：此时响应已声明 content-length
-		// 却少发字节，客户端必然报「传输被终止」——那是客户端自己的错误态。
-		logWarn("回源流提前结束: %v", err)
+		// 区分良性断开与真故障：播放器切歌/预加载 abort 同样表现为写端 reset；
+		// 早期断开（几乎没发数据）多为良性，大量传输后断开才值得追查。
+		logWarn("回源流提前结束（已发 %d 字节，起点 %d）: %v", written, start, err)
 	}
 }
 

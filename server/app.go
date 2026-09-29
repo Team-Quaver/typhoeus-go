@@ -43,6 +43,9 @@ type App struct {
 
 // NewApp 组装应用。
 func NewApp() (*App, error) {
+	// typhoeus 协商/中继层的诊断日志统一走 sidecar 日志（membership 判定、
+	// 嗅探放行、平台回退等——排查「高阶莫名降档/播不了」的关键线索源）
+	typhoeus.Logf = logWarn
 	sess, err := NewSession()
 	if err != nil {
 		return nil, err

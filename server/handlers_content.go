@@ -60,7 +60,7 @@ func (a *App) handleUserVip(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeVip(raw))
 }
 
 func (a *App) handleUserLiked(w http.ResponseWriter, r *http.Request) {
