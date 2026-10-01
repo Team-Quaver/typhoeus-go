@@ -497,3 +497,22 @@ func (a *App) handleSonglistDelSong(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOK(w, map[string]any{"ok": ok})
 }
+
+func (a *App) handleSonglistDelete(w http.ResponseWriter, r *http.Request) {
+	// 删除自建歌单（PlaylistBaseWrite DelPlaylist，仅自建歌单可删）。
+	// 注意 dirid ≠ disstid：这里要歌单目录 ID（created-songlists 列表项的 dirid），
+	// 不是歌单 tid；删别人的/不存在的歌单上游会报错。上游业务码非零已在
+	// ParseCGIData 报错，走到这里再核一眼 retCode 兜底。
+	var dirid int64
+	fmt.Sscanf(r.PathValue("dirid"), "%d", &dirid)
+	raw, err := a.call(true, func() (json.RawMessage, error) { return a.songlist.Delete(dirid) })
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	var resp struct {
+		RetCode int64 `json:"retCode"`
+	}
+	_ = json.Unmarshal(raw, &resp)
+	writeOK(w, map[string]any{"ok": resp.RetCode == 0})
+}

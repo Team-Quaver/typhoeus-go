@@ -117,6 +117,7 @@ func (a *App) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /songlist/fav/check", a.handleSonglistFavCheck)
 	mux.HandleFunc("POST /songlist/{dirid}/songs", a.handleSonglistAddSong)
 	mux.HandleFunc("DELETE /songlist/{dirid}/songs", a.handleSonglistDelSong)
+	mux.HandleFunc("DELETE /songlist/{dirid}", a.handleSonglistDelete)
 
 	// 搜索
 	mux.HandleFunc("GET /search/hotkey", a.handleSearchHotkey)
