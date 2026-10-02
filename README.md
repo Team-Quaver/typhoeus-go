@@ -1,6 +1,6 @@
 # Typhoeus Server (Go)
 
-Quaver Typhoeus 的 Golang 服务后端 —— 基于 [vendor/QQMusicApi](https://github.com/L-1124/QQMusicApi)（Python SDK）的接口语义重写，接入 vendor/Typhoeus 的档位协商/流中继设计，并**新增会员加密流的内存解密播放**。
+Quaver Typhoeus 的 Golang 服务后端。替代 L-1124 版 Python API 服务端与 Typhoeus 1.0 后端
 
 ## 功能
 
@@ -8,7 +8,7 @@ Quaver Typhoeus 的 Golang 服务后端 —— 基于 [vendor/QQMusicApi](https:
 - **账号**：主页信息、VIP 会员信息、我喜欢（红心列表）、自建歌单、收藏歌单
 - **播放流（Typhoeus）**：
   - 明文高阶档位全开：标准 128 → HQ → SQ(FLAC/OGG 640) → **臻品音质 2.0 / 全景声 5.1 / 7.1 / 母带 / DTS:X / 杜比全景声(AC-4)**
-  - **加密档位解密播放**（黑胶/加密 FLAC/加密 OGG 等）：取 `CgiGetEVkey` 的 ekey，按 Range 分片在内存中解密直推，**全链路不落盘、无整文件内存峰值、ekey 不透传**
+  - **加密档位解密播放**（黑胶/加密 FLAC/加密 OGG 等）：**全链路不落盘、无整文件内存峰值、ekey 不透传**
   - 会员门控（403）+ rank 回退链 + 自动降档模式（`auto`）+ 回退链降权（`deprioritize`）
   - 首块嗅探防「明文档位偶发下发密文」；加密流解密后嗅探验证 ekey 正确性
   - 标准 Range 中继（206/416/后缀区间），断流自动按已发字节重连续传（2 次）
@@ -16,6 +16,7 @@ Quaver Typhoeus 的 Golang 服务后端 —— 基于 [vendor/QQMusicApi](https:
 - **每日三十首**：系统虚拟歌单 `dirid=202`（每天由服务端重新生成）
 - **无限电台**：猜你喜欢多轮串行拉取 + 按 mid 去重（上游单次只给 5 首）
 - **其余**：搜索（类型/综合/补全/热搜）、榜单、专辑、歌手、歌词、热评
+- **系统集成**： MPRIS/NowPlaying/SMTC、Inhibit/电源断言、XDG 桌面门户与全局快捷键。
 
 ## 运行
 
@@ -67,38 +68,7 @@ QUAVER_PORT=3200 ./typhoeus-go        # 默认 http://127.0.0.1:3200
 | GET  | `/singer/{mid}/info` `/songs?order=` `/albums` `/similar` `/desc` | 歌手 |
 
 档位 id：`128` `320` `320ogg` `640ogg` `flac` `atmos2` `atmos51` `atmos71` `master` `dts` `atmosdb` `vinyl`。
-带 `encrypted: true` 的响应表示该流由后端解密（仅会员）。
-
-## 工程结构（2.0 接入友好）
-
-```
-cmd/quaver-server/   启动入口
-qmc/                 QMC 解密（可独立复用）：tc_tea / ekey / Map / RC4，按绝对偏移可解密
-qqmusic/             QQ 音乐 SDK 层（可独立复用，对标 vendor/QQMusicApi 核心）
-  ├── client.go        HTTP 池 + CGI 执行器（comm/签名/错误映射）
-  ├── credential.go    凭证（与 Python QCRED1 JSON 双向兼容）
-  ├── device.go        虚拟 Android 设备指纹（生成/持久化）
-  ├── qimei.go         QIMEI（RSA+AES+MD5 签名）
-  ├── android_session.go  匿名会话（跨自然日保活）
-  ├── mqtt/            MQTT 5.0 over WSS 最小客户端（与 paho 线上字节对拍）
-  └── modules/         业务模块：login/song/user/songlist/recommend/top/lyric/search/album/singer/comment
-typhoeus/            档位协商 + 流中继（可独立复用）：quality/resolver/provider/stream
-server/              HTTP API 层：路由/信封/错误映射/会话/凭证交接
-tools/gen_qmc_vectors.py  用 unlock-music 对拍实现生成 qmc 跨语言测试向量
-```
-
-公开包（`qmc` / `qqmusic` / `typhoeus`）都是普通 library 包，Quaver Typhoeus 2.0 可以
-`import "github.com/team-quaver/typhoeus-go/…"` 直接复用 SDK/协商/解密能力，无需经 HTTP。
-
-## 算法与测试
-
-- **qmc 包**：与 unlock-music 官方 Rust 实现（lib_um_crypto_rust）逐字节对拍；
-  内置 Rust 单测向量 + `tools/gen_qmc_vectors.py` 生成的跨语言随机对拍向量
-  （`QMC_CROSS_VECTORS=qmc/vectors.json go test ./qmc/`）。
-- **签名/凭证**：zzc 签名与 Python 实现对拍；凭证 JSON 与 QCRED1 管道双向兼容。
-- **MQTT**：CONNECT/SUBSCRIBE 字节与 paho-mqtt 逐帧对拍（属性区长度前缀、重定向跟随）。
-- 响应体不做强类型建模（`json.RawMessage` 透传），字段最全、上游演进零维护；
-  仅在需要结构化处（取链/会员/歌单收藏/歌手简介）就地小结构解析。
+带 `encrypted: true` 的响应表示该流由后端不落盘解密（仅会员）。
 
 ## 已知边界
 
