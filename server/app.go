@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/team-quaver/typhoeus-go/inhibit"
 	"github.com/team-quaver/typhoeus-go/qqmusic"
 	"github.com/team-quaver/typhoeus-go/qqmusic/modules"
 	"github.com/team-quaver/typhoeus-go/typhoeus"
@@ -31,6 +32,9 @@ type App struct {
 	singer   *modules.SingerModule
 	comment  *modules.CommentModule
 
+	// 播放音频时睡眠禁止（[Playing] InhibitSleep；渲染层经 POST /inhibit 驱动，本进程持有）
+	inhibit *inhibit.Inhibitor
+
 	// QR 状态
 	qrLocks      sync.Map // identifier → *sync.Mutex（qq/wx 轮询互斥）
 	mobileMu     sync.Mutex
@@ -46,6 +50,13 @@ func NewApp() (*App, error) {
 	// typhoeus 协商/中继层的诊断日志统一走 sidecar 日志（membership 判定、
 	// 嗅探放行、平台回退等——排查「高阶莫名降档/播不了」的关键线索源）
 	typhoeus.Logf = logWarn
+	inhibit.Logf = func(level, format string, args ...any) {
+		if level == "WARN" {
+			logWarn(format, args...)
+			return
+		}
+		logInfo(format, args...)
+	}
 	sess, err := NewSession()
 	if err != nil {
 		return nil, err
@@ -69,6 +80,7 @@ func NewApp() (*App, error) {
 		album:        modules.NewAlbumModule(sess.Client()),
 		singer:       modules.NewSingerModule(sess.Client()),
 		comment:      modules.NewCommentModule(sess.Client()),
+		inhibit:      inhibit.New(),
 		mobileStates: map[string]*mobileQRState{},
 		streams:      map[string]*streamEntry{},
 	}
@@ -141,6 +153,9 @@ func (a *App) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /singer/{mid}/albums", a.handleSingerAlbums)
 	mux.HandleFunc("GET /singer/{mid}/similar", a.handleSingerSimilar)
 	mux.HandleFunc("GET /singer/{mid}/desc", a.handleSingerDesc)
+
+	// 睡眠禁止（播放态由渲染层驱动；本进程持有，进程退出 OS 自动回收）
+	mux.HandleFunc("POST /inhibit", a.handleInhibit)
 
 	return mux
 }
