@@ -62,8 +62,26 @@ var (
 	EncOGG96    = SongFileType{"OGG_96_ENC", "O4M0", ".mgg"}
 )
 
-// IsEncrypted 加密类型集合判别。
+// encryptedExts 加密容器的扩展名集合（QMC 密文形态）。
+// 明文孪生各有别的扩展名（.flac/.ogg/.m4a/.mp4/.nac），不会与之混淆，所以扩展名
+// 是比枚举名更权威、也更抗「调用方自造类型名」的判别依据。
+var encryptedExts = map[string]struct{}{
+	".mflac": {},
+	".mgg":   {},
+	".mmp4":  {},
+	".mnac":  {},
+}
+
+// IsEncrypted 加密类型判别（需走 CgiGetEVkey 通道并取 ekey 解密）。
+//
+// 主判据是扩展名：调用方（如 typhoeus resolver 的 encType）按档位现造 SongFileType 时
+// 枚举名并不一定等于下面的常量名，早期按名字匹配导致这些类型被误判成明文、错走 UrlGetVkey
+// 通道拿不到 ekey —— 这正是「只有批量兜底档能解、其余加密档全哑」的根因。
+// 名字集合仅作兼容保留（上游枚举直用时）。
 func IsEncrypted(t SongFileType) bool {
+	if _, ok := encryptedExts[t.Ext]; ok {
+		return true
+	}
 	switch t.Name {
 	case "DTS_X_ENC", "VINYL", "MASTER_ENC", "ATMOS_2_ENC", "ATMOS_51_ENC", "ATMOS_71_ENC",
 		"ATMOS_DB_ENC", "NAC_ENC", "FLAC_ENC", "OGG_640_ENC", "OGG_320_ENC", "OGG_192_ENC", "OGG_96_ENC":

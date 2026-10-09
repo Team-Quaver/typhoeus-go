@@ -64,13 +64,17 @@ func (t *Tier) hasEnc() bool { return t.EncPref != "" }
 
 // 档位表（rank 升序）。明文/加密形态按实际可用性标注：
 //   - mp3 无加密孪生（官方从不下发 m* 加密 mp3）
+//   - OGG 系（96/192/320/640）与 FLAC/臻品系都有 QMC 加密孪生（.mgg/.mflac），
+//     逐档走 CgiGetEVkey 取 ekey 后内存解密播放；明文孪生前缀见 PlainPref
 //   - NAC（TL01 腾讯自研 codec）浏览器不可播，不进档位表
 //   - dts/atmosdb/vinyl 三档已裁撤（2026-09-28）：DTS:X mp4 的 `dtsx` codec tag
 //     ffmpeg 不识别（mov 解复用出 codec=unknown，mpv 报「无法初始化解码器」）、
 //     AC-4 需要捆绑 ffmpeg 没有编入的解码器、黑胶无明文形态且从未被上游放行过。
 //     裁撤后 auto 回退链不再指向不可播档。
 var tierTable = []*Tier{
+	{ID: "96ogg", Label: "流畅音质 (OGG)", PlainPref: "O400", PlainExt: ".ogg", EncPref: "O4M0", EncExt: ".mgg", Mime: "audio/ogg", Ext: ".ogg", Rank: 5, Requires: 0},
 	{ID: "128", Label: "标准音质", PlainPref: "M500", PlainExt: ".mp3", EncPref: "", EncExt: "", Mime: "audio/mpeg", Ext: ".mp3", Rank: 10, Requires: 0},
+	{ID: "192ogg", Label: "高品质 HQ (OGG 192)", PlainPref: "O600", PlainExt: ".ogg", EncPref: "O6M0", EncExt: ".mgg", Mime: "audio/ogg", Ext: ".ogg", Rank: 15, Requires: 1},
 	{ID: "320", Label: "高品质 HQ", PlainPref: "M800", PlainExt: ".mp3", EncPref: "", EncExt: "", Mime: "audio/mpeg", Ext: ".mp3", Rank: 20, Requires: 1},
 	{ID: "320ogg", Label: "高品质 HQ (OGG)", PlainPref: "O800", PlainExt: ".ogg", EncPref: "O8M0", EncExt: ".mgg", Mime: "audio/ogg", Ext: ".ogg", Rank: 25, Requires: 1},
 	{ID: "640ogg", Label: "无损 SQ (OGG)", PlainPref: "O801", PlainExt: ".ogg", EncPref: "O8M1", EncExt: ".mgg", Mime: "audio/ogg", Ext: ".ogg", Rank: 30, Requires: 1},

@@ -174,7 +174,11 @@ func (p *QQMusicProvider) resolveLinksPlatform(ctx context.Context, mid, mediaMi
 			url = domain + it.Purl
 		}
 		out = append(out, LinkResult{
-			Mid:        it.Songmid,
+			// 单文件取链：结果恒对应请求的那首歌，直接用请求 mid 归档。
+			// 不能用回包里的 songmid——EVkey 加密通道按 lyrune 语义以 media_mid 作 songmid 发请求，
+			// 上游会原样回 media_mid；media_mid != mid 的歌若按回包归档，pickLink(links, mid)
+			// 会全部落空，加密档就只剩批量兜底那一档能播（历史症状「只有 HD OGG 能解」）。
+			Mid:        mid,
 			Playable:   playable,
 			URL:        url,
 			Filename:   it.Filename,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/team-quaver/typhoeus-go/qmc"
@@ -133,9 +134,40 @@ func (r *StreamResolver) Resolve(ctx context.Context, mid, mediaMid, tierID stri
 	return nil, errProvider(fmt.Sprintf("无可播档位（最后上游 result=%d）", lastCode))
 }
 
+// evkeyCandidate 批量取链里一个「已放行」的加密条目（可解密、可播）。
+type evkeyCandidate struct {
+	tier  *Tier
+	entry modules.EVkeyEntry
+}
+
+// bestEVkeyCandidates 从批量响应里筛出可播条目并按音质从高到低排序。
+//
+// 上游按请求顺序回条目，而请求是按 tierTable 升序拼的；若原样「谁先放行用谁」，
+// 批量兜底就会把请求「母带」的歌降到链上最低的一档（历史上表现为无论选多高都只出
+// OGG_320）。批量兜底的语义是「取最接近请求档位的那一档」，所以这里显式按 rank 降序，
+// 让调用方从高往低试。
+func bestEVkeyCandidates(entries []modules.EVkeyEntry, byPrefix map[string]*Tier) []evkeyCandidate {
+	cands := make([]evkeyCandidate, 0, len(entries))
+	for _, e := range entries {
+		if e.Result != 0 || e.Purl == "" || e.Ekey == "" {
+			continue
+		}
+		tier := byPrefix[prefixOf(e.Filename, byPrefix)]
+		if tier == nil {
+			continue
+		}
+		cands = append(cands, evkeyCandidate{tier: tier, entry: e})
+	}
+	sort.SliceStable(cands, func(i, j int) bool {
+		return cands[i].tier.Rank > cands[j].tier.Rank
+	})
+	return cands
+}
+
 // resolveEncryptedBatch 把单个档位的加密形态交给批量 EVkey 请求处理：
-// 同一请求里带上全档位加密变体（rank ≤ 该档位），命中哪个回哪个。
-// 命中即按文件名前缀映射回档位并构建解密流。
+// 同一请求里带上全档位加密变体（rank ≤ 该档位），命中后取「最接近请求档位」
+// 的可播档（同档多命中时按 rank 降序试到第一个能解密的）。命中即按文件名前缀
+// 映射回档位并构建解密流。
 func (r *StreamResolver) resolveEncryptedBatch(ctx context.Context, mid, mediaMid string, target *Tier) (*ResolvedStream, error) {
 	variants := make([]modules.EVkeyVariant, 0, len(tierTable))
 	byPrefix := map[string]*Tier{}
@@ -153,27 +185,20 @@ func (r *StreamResolver) resolveEncryptedBatch(ctx context.Context, mid, mediaMi
 	if err != nil {
 		return nil, errProvider(fmt.Sprintf("EVkey 批量取链失败: %v", err))
 	}
-	for _, e := range entries {
-		if e.Result != 0 || e.Purl == "" || e.Ekey == "" {
-			continue
-		}
-		tier := byPrefix[prefixOf(e.Filename, byPrefix)]
-		if tier == nil {
-			continue
-		}
-		cipher, cerr := qmc.NewCipherFromEkey(e.Ekey)
+	for _, c := range bestEVkeyCandidates(entries, byPrefix) {
+		cipher, cerr := qmc.NewCipherFromEkey(c.entry.Ekey)
 		if cerr != nil {
 			continue // ekey 不可用（过期/格式变化）
 		}
-		if r.probePlain && !r.sniffDecryptedOK(ctx, r.provider.streamURL(ctx, e.Purl), cipher) {
+		if r.probePlain && !r.sniffDecryptedOK(ctx, r.provider.streamURL(ctx, c.entry.Purl), cipher) {
 			continue // 解密后仍非明文容器（ekey 不匹配）
 		}
 		return &ResolvedStream{
-			Mid: mid, Tier: tier, RequestedTier: target,
-			URL:      r.provider.streamURL(ctx, e.Purl),
-			Filename: e.Filename,
+			Mid: mid, Tier: c.tier, RequestedTier: target,
+			URL:       r.provider.streamURL(ctx, c.entry.Purl),
+			Filename:  c.entry.Filename,
 			Encrypted: true, Cipher: cipher,
-			Degraded: tier != target,
+			Degraded: c.tier != target,
 		}, nil
 	}
 	return nil, errProvider("EVkey 批量无可播条目")
