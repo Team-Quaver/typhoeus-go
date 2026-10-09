@@ -137,3 +137,27 @@ func TestNormalizeSingerAlbums(t *testing.T) {
 		t.Fatalf("外层字段丢失: %v", out)
 	}
 }
+
+// TestNormalizeAlbumSongsPreservesSourceOrder 专辑曲序由上游 songList 给出；
+// 归一化只能解包 songInfo，不能按歌曲字段重新排序。
+func TestNormalizeAlbumSongsPreservesSourceOrder(t *testing.T) {
+	raw := json.RawMessage(`{
+		"albumMid": "album-mid", "totalNum": 3,
+		"songList": [
+			{"songInfo": {"mid": "track-3", "name": "第三首"}},
+			{"songInfo": {"mid": "track-1", "name": "第一首"}},
+			{"songInfo": {"mid": "track-2", "name": "第二首"}}
+		]}`)
+	out := normalizeAlbumSongs(raw)
+	songs, ok := out["song_list"].(arr)
+	if !ok || len(songs) != 3 {
+		t.Fatalf("song_list 应保留 3 首歌曲: %v", out["song_list"])
+	}
+	want := []string{"track-3", "track-1", "track-2"}
+	for i, v := range songs {
+		got := strOf(asObj(v), "mid")
+		if got != want[i] {
+			t.Fatalf("曲序被改写: index=%d got=%q want=%q", i, got, want[i])
+		}
+	}
+}
