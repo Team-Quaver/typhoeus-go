@@ -138,22 +138,22 @@ func TestNormalizeSingerAlbums(t *testing.T) {
 	}
 }
 
-// TestNormalizeAlbumSongsPreservesSourceOrder 专辑曲序由上游 songList 给出；
+// TestNormalizeAlbumSongsUsesAlbumOrder 专辑曲序由上游 songInfo.index_album 给出；
 // 归一化只能解包 songInfo，不能按歌曲字段重新排序。
-func TestNormalizeAlbumSongsPreservesSourceOrder(t *testing.T) {
+func TestNormalizeAlbumSongsUsesAlbumOrder(t *testing.T) {
 	raw := json.RawMessage(`{
 		"albumMid": "album-mid", "totalNum": 3,
 		"songList": [
-			{"songInfo": {"mid": "track-3", "name": "第三首"}},
-			{"songInfo": {"mid": "track-1", "name": "第一首"}},
-			{"songInfo": {"mid": "track-2", "name": "第二首"}}
+			{"songInfo": {"mid": "track-2", "name": "第二首", "index_album": 2}},
+			{"songInfo": {"mid": "track-3", "name": "第三首", "index_album": 3}},
+			{"songInfo": {"mid": "track-1", "name": "第一首", "index_album": 1}}
 		]}`)
 	out := normalizeAlbumSongs(raw)
 	songs, ok := out["song_list"].(arr)
 	if !ok || len(songs) != 3 {
 		t.Fatalf("song_list 应保留 3 首歌曲: %v", out["song_list"])
 	}
-	want := []string{"track-3", "track-1", "track-2"}
+	want := []string{"track-1", "track-2", "track-3"}
 	for i, v := range songs {
 		got := strOf(asObj(v), "mid")
 		if got != want[i] {

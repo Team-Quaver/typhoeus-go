@@ -12,6 +12,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -251,11 +252,45 @@ func normalizeAlbumDetail(raw json.RawMessage) obj {
 // —— 专辑歌曲（GetAlbumSongResponse：song_list←songList[*].songInfo）——
 func normalizeAlbumSongs(raw json.RawMessage) obj {
 	d := decodeObj(raw)
-	songs := arr{}
+	type albumSong struct {
+		song     obj
+		index    int64
+		hasIndex bool
+	}
+	items := []albumSong{}
 	for _, it := range arrOf(d, "songList") {
 		if s := objOf(asObj(it), "songInfo"); s != nil {
-			songs = append(songs, s)
+			indexValue := firstOf(s, "index_album", "indexAlbum")
+			items = append(items, albumSong{
+				song:     s,
+				index:    nval(indexValue),
+				hasIndex: indexValue != nil,
+			})
 		}
+	}
+	// AlbumSongList 的返回数组不是曲序（例如会把第 2 首放在第 1 首前），
+	// 但每个 songInfo 都带有 index_album。按这个上游曲序字段恢复专辑原序；
+	// 没有曲序字段的旧响应则保持接口原顺序。
+	if len(items) > 0 {
+		hasIndexes := false
+		for _, item := range items {
+			if item.hasIndex {
+				hasIndexes = true
+				break
+			}
+		}
+		if hasIndexes {
+			sort.SliceStable(items, func(i, j int) bool {
+				if items[i].hasIndex != items[j].hasIndex {
+					return items[i].hasIndex
+				}
+				return items[i].index < items[j].index
+			})
+		}
+	}
+	songs := arr{}
+	for _, item := range items {
+		songs = append(songs, item.song)
 	}
 	return obj{
 		"album_mid": strOf(d, "albumMid", "album_mid"),
