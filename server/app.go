@@ -32,8 +32,10 @@ type App struct {
 	singer   *modules.SingerModule
 	comment  *modules.CommentModule
 
-	// 播放音频时睡眠禁止（[Playing] InhibitSleep；渲染层经 POST /inhibit 驱动，本进程持有）
-	inhibit *inhibit.Inhibitor
+	// 电源抑制：播放音频时禁止睡眠，画廊模式时禁止进入空闲（渲染层经 POST /inhibit
+	// 驱动；两个句柄独立持有，退出 sidecar 时由 OS 自动回收）。
+	inhibitSleep *inhibit.Inhibitor
+	inhibitIdle  *inhibit.Inhibitor
 
 	// QR 状态
 	qrLocks      sync.Map // identifier → *sync.Mutex（qq/wx 轮询互斥）
@@ -80,7 +82,8 @@ func NewApp() (*App, error) {
 		album:        modules.NewAlbumModule(sess.Client()),
 		singer:       modules.NewSingerModule(sess.Client()),
 		comment:      modules.NewCommentModule(sess.Client()),
-		inhibit:      inhibit.New(),
+		inhibitSleep: inhibit.New(),
+		inhibitIdle:  inhibit.NewWithMode(inhibit.ModeIdle),
 		mobileStates: map[string]*mobileQRState{},
 		streams:      map[string]*streamEntry{},
 	}

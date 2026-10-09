@@ -3,9 +3,8 @@
 // Windows —— 电源请求对象（winbase.h：PowerCreateRequest / PowerSetRequest /
 // PowerClearRequest，Kernel32.dll，Win7+，无需特权）。
 //
-// 请求类型只置 PowerRequestSystemRequired（POWER_REQUEST_TYPE 枚举值 1：
-// 0=DisplayRequired 1=SystemRequired 2=AwayModeRequired）：阻止系统睡眠；
-// 不碰 DisplayRequired —— 屏幕按电源计划正常熄灭。
+// ModeSleep 置 PowerRequestSystemRequired（枚举值 1），ModeIdle 置
+// PowerRequestDisplayRequired（枚举值 0），分别对应阻止系统睡眠与阻止显示器熄灭。
 //
 // 生命周期：Create（失败返回 INVALID_HANDLE_VALUE）→ Set（激活，进程内可反复
 // Set/Clear）→ Clear + CloseHandle 释放；进程退出 OS 自动回收句柄。
@@ -25,12 +24,12 @@ import (
 
 const (
 	// POWER_REQUEST_TYPE（winnt.h 枚举序）
-	powerRequestSystemRequired = 1
+	powerRequestDisplayRequired = 0
+	powerRequestSystemRequired  = 1
 	// REASON_CONTEXT 标志
 	reasonContextVersion      = 0 // POWER_REQUEST_CONTEXT_VERSION
 	reasonContextSimpleString = 1 // POWER_REQUEST_CONTEXT_SIMPLE_STRING
 
-	reasonText = "Quaver 正在播放音频"
 )
 
 var (
@@ -52,10 +51,11 @@ type reasonContext struct {
 }
 
 type windowsBackend struct {
+	mode   Mode
 	handle windows.Handle // 0 = 未持有
 }
 
-func newBackend() (platformBackend, error) { return &windowsBackend{}, nil }
+func newBackend(mode Mode) (platformBackend, error) { return &windowsBackend{mode: mode}, nil }
 
 func (b *windowsBackend) acquire() error {
 	if b.handle != 0 {
@@ -63,21 +63,21 @@ func (b *windowsBackend) acquire() error {
 	}
 	// LazyProc 找不到符号会 panic（不该发生在 Win7+，但别赌）——先 Find 走 error 路径
 	if err := procPowerCreateRequest.Find(); err != nil {
-		return fmt.Errorf("睡眠禁止：kernel32 缺少电源请求接口: %w", err)
+		return fmt.Errorf("电源抑制：kernel32 缺少电源请求接口: %w", err)
 	}
-	why, err := windows.UTF16PtrFromString(reasonText)
+	why, err := windows.UTF16PtrFromString(b.reason())
 	if err != nil {
-		return fmt.Errorf("睡眠禁止：原因串编码失败: %w", err)
+		return fmt.Errorf("电源抑制：原因串编码失败: %w", err)
 	}
 	ctx := reasonContext{Version: reasonContextVersion, Flags: reasonContextSimpleString, Reason: why}
 	r1, _, lastErr := procPowerCreateRequest.Call(uintptr(unsafe.Pointer(&ctx)))
 	if r1 == 0 || r1 == uintptr(^uintptr(0)) { // NULL（理论外）/ INVALID_HANDLE_VALUE
-		return fmt.Errorf("睡眠禁止：PowerCreateRequest 失败: %v", lastErr)
+		return fmt.Errorf("电源抑制：PowerCreateRequest 失败: %v", lastErr)
 	}
 	h := windows.Handle(r1)
-	if r1, _, lastErr := procPowerSetRequest.Call(uintptr(h), powerRequestSystemRequired); r1 == 0 {
+	if r1, _, lastErr := procPowerSetRequest.Call(uintptr(h), uintptr(b.requestType())); r1 == 0 {
 		_ = windows.CloseHandle(h)
-		return fmt.Errorf("睡眠禁止：PowerSetRequest 失败: %v", lastErr)
+		return fmt.Errorf("电源抑制：PowerSetRequest 失败: %v", lastErr)
 	}
 	b.handle = h
 	return nil
@@ -88,7 +88,21 @@ func (b *windowsBackend) release() {
 		return
 	}
 	// Clear 失败不阻断：CloseHandle 后整个请求对象连同激活态一起消失
-	_, _, _ = procPowerClearRequest.Call(uintptr(b.handle), powerRequestSystemRequired)
+	_, _, _ = procPowerClearRequest.Call(uintptr(b.handle), uintptr(b.requestType()))
 	_ = windows.CloseHandle(b.handle)
 	b.handle = 0
+}
+
+func (b *windowsBackend) requestType() uint32 {
+	if b.mode == ModeIdle {
+		return powerRequestDisplayRequired
+	}
+	return powerRequestSystemRequired
+}
+
+func (b *windowsBackend) reason() string {
+	if b.mode == ModeIdle {
+		return "Quaver 正在画廊播放"
+	}
+	return "Quaver 正在播放音频"
 }

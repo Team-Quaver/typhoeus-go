@@ -9,12 +9,14 @@
 // 断言字典（键为 CFString，按内容等值比较 → 必须配 kCFCopyStringDictionaryKeyCallBacks；
 // 值回调用 kCFTypeDictionaryValueCallBacks 让字典接管 retain/release）：
 //
-//	"AssertType"  → CFString "PreventUserIdleSystemSleep"（kIOPMAssertPreventUserIdleSystemSleep）
+//	"AssertType"  → CFString "PreventUserIdleSystemSleep" 或
+//	                  "PreventUserIdleDisplaySleep"
 //	"AssertLevel" → CFNumber(kCFNumberIntType) 255（kIOPMAssertionLevelOn）
 //	"AssertName"  → CFString "Quaver"（kIOPMAssertionNameKey：pmset -g assertions 里可见，便于排查）
 //
-// PreventUserIdleSystemSleep 的官方语义与另两平台同口径：显示器照常变暗/熄屏，
-// 系统不许因空闲而睡；合盖、菜单休眠、低电量等其他睡因不受影响。
+// ModeSleep 使用 PreventUserIdleSystemSleep，ModeIdle 使用
+// PreventUserIdleDisplaySleep；后者保持画廊显示器亮起。合盖、菜单休眠、低电量等
+// 其他睡因不受影响。
 // 释放 = IOPMAssertionRelease(断言 ID)；kIOPMNullAssertionID=0 不可释放。
 //
 // 实现经 purego 走 dlopen 调 C ABI —— sidecar 全线零 cgo（CI 以 CGO_ENABLED=0
@@ -39,10 +41,9 @@ const (
 	kCFNumberIntType      = 9 // CFNumberType：C int（32 位）
 	kIOPMAssertionLevelOn = 255
 
-	assertTypeKey   = "AssertType"                 // kIOPMAssertionTypeKey
-	assertLevelKey  = "AssertLevel"                // kIOPMAssertionLevelKey
-	assertNameKey   = "AssertName"                 // kIOPMAssertionNameKey
-	assertTypeValue = "PreventUserIdleSystemSleep" // kIOPMAssertPreventUserIdleSystemSleep
+	assertTypeKey   = "AssertType"  // kIOPMAssertionTypeKey
+	assertLevelKey  = "AssertLevel" // kIOPMAssertionLevelKey
+	assertNameKey   = "AssertName"  // kIOPMAssertionNameKey
 	assertNameValue = "Quaver"
 )
 
@@ -119,11 +120,12 @@ func cfStringOf(s string) unsafe.Pointer {
 }
 
 type darwinBackend struct {
+	mode      Mode
 	mu        sync.Mutex
 	assertion uint32 // IOPMAssertionID；0 = kIOPMNullAssertionID = 未持有
 }
 
-func newBackend() (platformBackend, error) { return &darwinBackend{}, nil }
+func newBackend(mode Mode) (platformBackend, error) { return &darwinBackend{mode: mode}, nil }
 
 func (b *darwinBackend) acquire() error {
 	b.mu.Lock()
@@ -142,7 +144,7 @@ func (b *darwinBackend) acquire() error {
 	defer cfRelease(dict)
 
 	level := uint32(kIOPMAssertionLevelOn)
-	typeValue := cfStringOf(assertTypeValue)
+	typeValue := cfStringOf(b.assertionType())
 	levelValue := cfNumberCreate(0, kCFNumberIntType, unsafe.Pointer(&level))
 	nameValue := cfStringOf(assertNameValue)
 	typeKey, levelKey, nameKey := cfStringOf(assertTypeKey), cfStringOf(assertLevelKey), cfStringOf(assertNameKey)
@@ -167,6 +169,13 @@ func (b *darwinBackend) acquire() error {
 	}
 	b.assertion = id
 	return nil
+}
+
+func (b *darwinBackend) assertionType() string {
+	if b.mode == ModeIdle {
+		return "PreventUserIdleDisplaySleep"
+	}
+	return "PreventUserIdleSystemSleep"
 }
 
 func (b *darwinBackend) release() {
