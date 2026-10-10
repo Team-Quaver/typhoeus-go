@@ -55,7 +55,10 @@ func (r *StreamResolver) Resolve(ctx context.Context, mid, mediaMid, tierID stri
 	if mediaMid == "" {
 		mediaMid = mid
 	}
-	membership := r.provider.Membership(ctx)
+	membership, err := r.provider.Membership(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if Membership(target.Requires) > membership && !autoDowngrade {
 		return nil, errMembershipRequired(gateReason(membership, target))
 	}

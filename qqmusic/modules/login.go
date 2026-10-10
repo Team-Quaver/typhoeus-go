@@ -5,6 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,7 +21,9 @@ import (
 
 // LoginModule 登录域接口（QQ 二维码 / 微信二维码 / 手机客户端二维码 + 刷新/登出）。
 type LoginModule struct {
-	cl *qqmusic.Client
+	cl         *qqmusic.Client
+	qqMu       sync.Mutex
+	qqSessions map[string]*qqLoginSession
 
 	// mqttNode 缓存上次成功的 MQTT 握手路径（含节点段），
 	// 下次连接直接命中节点，省一次 0x9D 重定向往返。
@@ -126,51 +132,120 @@ func (m *LoginModule) loginCgi(module, method string, param *qqmusic.JObj, comm 
 
 // ===================== QQ 二维码 =====================
 
-// GetQQQR 获取 QQ 授权二维码（ptqrshow；identifier 为 qrsig）。
+const qqLoginJump = "https://graph.qq.com/oauth2.0/login_jump"
+
+// 每张二维码独占 cookie jar。pt_login_sig/qrsig/中间响应 Cookie 必须跨轮询保存；
+// Cookie 的 Domain/Path/过期信息也必须保留，不能用全局或按名称合并的 map。
+type qqLoginSession struct {
+	mu        sync.Mutex
+	jar       http.CookieJar
+	created   time.Time
+	referer   string
+	jsVersion string
+	result    *QRLoginResult
+	err       error
+}
+
+func (s *qqLoginSession) cookies(rawURL string) map[string]string {
+	u, _ := url.Parse(rawURL)
+	cookies := map[string]string{}
+	for _, c := range s.jar.Cookies(u) {
+		cookies[c.Name] = c.Value
+	}
+	return cookies
+}
+
+func (m *LoginModule) qqRequest(ctx context.Context, session *qqLoginSession, method, rawURL string, opt qqmusic.HTTPOption) (*qqmusic.RawResponse, error) {
+	opt.Cookies, opt.Credential, opt.NoRedirect = session.cookies(rawURL), &qqmusic.Credential{}, true
+	resp, err := m.cl.DoHTTPPlainContext(ctx, method, rawURL, opt)
+	if err != nil {
+		e := qqmusic.AsAPIError(err)
+		return nil, &qqmusic.APIError{Kind: e.Kind, Code: e.Code, Message: "QQ 登录请求失败，请重新生成二维码"}
+	}
+	u, _ := url.Parse(rawURL)
+	// RawResponse.Cookies 按名字折叠，会丢掉重复名称、不同域和删除 Cookie；从头部解析完整集合。
+	session.jar.SetCookies(u, (&http.Response{Header: resp.Headers}).Cookies())
+	return resp, nil
+}
+
+// GetQQQR 从官方 xlogin 建立登录会话，再取二维码，保存本次会话供后续轮询。
 func (m *LoginModule) GetQQQR(ctx context.Context) (*QR, error) {
-	params := qqmusic.P("appid", "716027609", "e", "2", "l", "M", "s", "3", "d", "72", "v", "4",
-		"t", fmt.Sprintf("0.%d", time.Now().UnixNano()%1e10),
+	params := qqmusic.P("appid", "716027609", "daid", "383", "style", "40", "target", "self",
+		"s_url", qqLoginJump, "pt_3rd_aid", "100497308", "hide_title_bar", "1", "hide_border", "1")
+	jar, _ := cookiejar.New(nil)
+	session := &qqLoginSession{jar: jar, created: time.Now(), jsVersion: "26092315",
+		referer: "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?" + params.Encode()}
+	page, err := m.qqRequest(ctx, session, "GET", session.referer, qqmusic.HTTPOption{})
+	if err != nil {
+		return nil, err
+	}
+	if page.StatusCode != http.StatusOK {
+		return nil, qqmusic.NewDataError(fmt.Sprintf("QQ 登录页返回 HTTP %d", page.StatusCode))
+	}
+	if match := qqJSVersionRe.FindStringSubmatch(page.Text); len(match) > 1 {
+		session.jsVersion = match[1]
+	}
+	params = qqmusic.P("appid", "716027609", "e", "2", "l", "M", "s", "3", "d", "72", "v", "4",
+		"t", fmt.Sprintf("0.%d", time.Now().UnixNano()%1e10), "u1", qqLoginJump,
 		"daid", "383", "pt_3rd_aid", "100497308")
-	resp, err := m.cl.DoHTTPPlainContext(ctx, "GET", "https://ssl.ptlogin2.qq.com/ptqrshow", qqmusic.HTTPOption{
-		Params:  params,
-		Headers: map[string]string{"Referer": "https://xui.ptlogin2.qq.com/"},
+	resp, err := m.qqRequest(ctx, session, "GET", "https://ssl.ptlogin2.qq.com/ptqrshow", qqmusic.HTTPOption{
+		Params: params, Headers: map[string]string{"Referer": session.referer},
 	})
 	if err != nil {
 		return nil, err
 	}
-	qrsig := resp.Cookies["qrsig"]
-	if qrsig == "" {
-		return nil, qqmusic.NewDataError("获取 qrsig 失败")
+	qrsig := session.cookies("https://ssl.ptlogin2.qq.com/ptqrlogin")["qrsig"]
+	if resp.StatusCode != http.StatusOK || qrsig == "" {
+		return nil, qqmusic.NewDataError("获取 QQ 二维码失败")
 	}
+	m.qqMu.Lock()
+	if m.qqSessions == nil {
+		m.qqSessions = make(map[string]*qqLoginSession)
+	}
+	for id, old := range m.qqSessions {
+		if time.Since(old.created) > 10*time.Minute {
+			delete(m.qqSessions, id)
+		}
+	}
+	m.qqSessions[qrsig] = session
+	m.qqMu.Unlock()
 	return &QR{Data: resp.BodyBytes(), Type: QRTypeQQ, Mimetype: "image/png", Identifier: qrsig}, nil
 }
 
 // qqStatusRe ptuiCB('0','0','https://...','0','登录成功!', '昵称')
 var (
-	qqStatusRe = regexp.MustCompile(`ptuiCB\((.*?)\)`)
-	qqArgsRe   = regexp.MustCompile(`'((?:\\.|[^'])*)'`)
-	qqSigxRe   = regexp.MustCompile(`(?:\?|&)ptsigx=(.+?)&s_url`)
-	qqUinRe    = regexp.MustCompile(`(?:\?|&)uin=(.+?)&service`)
-	// oauth authorize 的 302 Location 里提取 code。注意 Go regexp 是 RE2：
-	// 不支持 lookbehind/lookahead（Python 移植来的 (?<=code=)...(?=&) 会在
-	// MustCompile 时直接 panic —— 手机确认后 authorize 每请求必炸，前端只看到
-	// 「确认了没反应」），改用捕获组。
-	qqCodeRe = regexp.MustCompile(`[?&]code=([^&]+)`)
+	qqJSVersionRe = regexp.MustCompile(`ptui_version:\s*encodeURIComponent\(["']([0-9]+)["']\)`)
+	qqStatusRe    = regexp.MustCompile(`ptuiCB\((.*?)\)`)
+	qqArgsRe      = regexp.MustCompile(`'((?:\\.|[^'])*)'`)
 )
 
 // CheckQQQR 轮询 QQ 二维码状态。
 func (m *LoginModule) CheckQQQR(ctx context.Context, qrsig string) (*QRLoginResult, error) {
+	m.qqMu.Lock()
+	session := m.qqSessions[qrsig]
+	if session != nil && time.Since(session.created) > 10*time.Minute {
+		delete(m.qqSessions, qrsig)
+		session = nil
+	}
+	m.qqMu.Unlock()
+	if session == nil {
+		return &QRLoginResult{Event: EventTimeout, Done: true}, nil
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.result != nil || session.err != nil {
+		return session.result, session.err
+	}
 	params := qqmusic.P(
 		"u1", "https://graph.qq.com/oauth2.0/login_jump",
 		"ptqrtoken", strconv.FormatInt(qqmusic.Hash33(qrsig, 0), 10),
 		"ptredirect", "0", "h", "1", "t", "1", "g", "1", "from_ui", "1", "ptlang", "2052",
 		"action", fmt.Sprintf("0-0-%d", time.Now().UnixMilli()),
-		"js_ver", "20102616", "js_type", "1", "pt_uistyle", "40",
+		"login_sig", session.cookies("https://xui.ptlogin2.qq.com/")["pt_login_sig"],
+		"js_ver", session.jsVersion, "js_type", "1", "pt_uistyle", "40",
 		"aid", "716027609", "daid", "383", "pt_3rd_aid", "100497308", "has_onekey", "1")
-	resp, err := m.cl.DoHTTPPlainContext(ctx, "GET", "https://ssl.ptlogin2.qq.com/ptqrlogin", qqmusic.HTTPOption{
-		Params:  params,
-		Headers: map[string]string{"Referer": "https://xui.ptlogin2.qq.com/"},
-		Cookies: map[string]string{"qrsig": qrsig},
+	resp, err := m.qqRequest(ctx, session, "GET", "https://ssl.ptlogin2.qq.com/ptqrlogin", qqmusic.HTTPOption{
+		Params: params, Headers: map[string]string{"Referer": session.referer},
 	})
 	if err != nil {
 		return nil, err
@@ -195,17 +270,25 @@ func (m *LoginModule) CheckQQQR(ctx context.Context, qrsig string) (*QRLoginResu
 	if len(args) < 3 {
 		return nil, qqmusic.NewDataError("获取登录凭据失败: 缺少必要参数")
 	}
-	redirectURL := args[2][1]
-	sigx := qqSigxRe.FindStringSubmatch(redirectURL)
-	uin := qqUinRe.FindStringSubmatch(redirectURL)
-	if sigx == nil || uin == nil {
-		return nil, qqmusic.NewDataError("获取登录凭据失败: 无法解析必要参数")
+	// 回跳参数顺序和位置不是协议保证；旧正则要求 uin 后紧跟 service、
+	// ptsigx 后紧跟 s_url，会在参数换序/末参时卡在「确认后没反应」。
+	redirectURL := html.UnescapeString(strings.NewReplacer(`\x26`, "&", `\u0026`, "&", `\/`, "/").Replace(args[2][1]))
+	redirect, parseErr := url.Parse(redirectURL)
+	if parseErr != nil {
+		return nil, qqmusic.NewDataError("获取登录凭据失败: 无效回跳地址")
 	}
-	cred, err := m.authorizeQQQR(ctx, uin[1], sigx[1])
+	if !qqLoginURLAllowed(redirect) || redirect.Path != "/check_sig" || redirect.Query().Get("ptsigx") == "" {
+		return nil, qqmusic.NewDataError("获取登录凭据失败: 无效授权回跳地址")
+	}
+	// ptsigx 是一次性凭据。保留上游完整地址（包括 pt_login_type/pt_3rd_aid 等），
+	// 不改写参数；确认后的失败也缓存，避免每 2s 重放已消费的签名。
+	cred, err := m.authorizeQQQR(ctx, redirect.String(), session)
 	if err != nil {
+		session.err = err
 		return nil, err
 	}
-	return &QRLoginResult{Event: EventDone, Done: true, Credential: cred}, nil
+	session.result = &QRLoginResult{Event: EventDone, Done: true, Credential: cred}
+	return session.result, nil
 }
 
 // qqEventFromCode ptuiCB 状态码 → 事件。
@@ -224,51 +307,110 @@ func qqEventFromCode(code int) QRLoginEvent {
 	}
 }
 
-// authorizeQQQR 用 sigx/uin 走 check_sig + oauth authorize，换取 QQConnect 登录凭证。
-func (m *LoginModule) authorizeQQQR(ctx context.Context, uin, sigx string) (*qqmusic.Credential, error) {
-	checkResp, err := m.cl.DoHTTPPlainContext(ctx, "GET", "https://ssl.ptlogin2.graph.qq.com/check_sig", qqmusic.HTTPOption{
-		Params: qqmusic.P(
-			"uin", uin, "pttype", "1", "service", "ptqrlogin", "nodirect", "0", "ptsigx", sigx,
-			"s_url", "https://graph.qq.com/oauth2.0/login_jump", "ptlang", "2052", "ptredirect", "100",
-			"aid", "716027609", "daid", "383", "j_later", "0", "low_login_hour", "0", "regmaster", "0",
-			"pt_login_type", "3", "pt_aid", "0", "pt_aaid", "16", "pt_light", "0", "pt_3rd_aid", "100497308"),
-		Headers:    map[string]string{"Referer": "https://xui.ptlogin2.qq.com/"},
-		NoRedirect: true,
-	})
+func qqLoginURLAllowed(u *url.URL) bool {
+	if u == nil || u.Scheme != "https" || u.User != nil || u.Port() != "" {
+		return false
+	}
+	switch u.Hostname() {
+	case "graph.qq.com", "ssl.ptlogin2.graph.qq.com", "ssl.ptlogin2.qq.com":
+		return true
+	default:
+		return false
+	}
+}
+
+// qqOAuthHTTP 手动跟随授权重定向，使用同一张二维码的 Cookie jar。
+func (m *LoginModule) qqOAuthHTTP(ctx context.Context, method, rawURL string, opt qqmusic.HTTPOption, session *qqLoginSession, wantCode bool) (*qqmusic.RawResponse, error) {
+	for hop := 0; hop < 5; hop++ {
+		resp, err := m.qqRequest(ctx, session, method, rawURL, opt)
+		if err != nil {
+			return nil, err
+		}
+		if (wantCode && qqOAuthCode(resp.Headers.Get("Location")) != "") || (!wantCode && session.cookies("https://graph.qq.com/oauth2.0/authorize")["p_skey"] != "") {
+			return resp, nil
+		}
+		if resp.StatusCode < 300 || resp.StatusCode > 399 || resp.Headers.Get("Location") == "" {
+			return resp, nil
+		}
+		base, _ := url.Parse(rawURL)
+		next, err := base.Parse(resp.Headers.Get("Location"))
+		if err != nil || !qqLoginURLAllowed(next) {
+			return nil, qqmusic.NewDataError("QQ 授权回跳地址异常，请重新生成二维码")
+		}
+		rawURL = next.String()
+		if resp.StatusCode != 307 && resp.StatusCode != 308 {
+			method, opt.FormBody = "GET", nil
+		}
+		opt.Params = nil
+		opt.Headers = map[string]string{"Referer": session.referer}
+	}
+	return nil, qqmusic.NewDataError("QQ 授权回跳次数过多，请重新生成二维码")
+}
+
+func qqOAuthCode(location string) string {
+	u, err := url.Parse(location)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" || (u.Hostname() != "y.qq.com" && u.Hostname() != "graph.qq.com") {
+		return ""
+	}
+	return u.Query().Get("code")
+}
+
+func (m *LoginModule) authorizeQQQR(ctx context.Context, redirectURL string, session *qqLoginSession) (*qqmusic.Credential, error) {
+	check, err := m.qqOAuthHTTP(ctx, "GET", redirectURL, qqmusic.HTTPOption{
+		Headers: map[string]string{"Referer": session.referer},
+	}, session, false)
 	if err != nil {
 		return nil, err
 	}
-	pSkey := checkResp.Cookies["p_skey"]
+	pSkey := session.cookies("https://graph.qq.com/oauth2.0/authorize")["p_skey"]
 	if pSkey == "" {
-		return nil, qqmusic.NewDataError("获取 p_skey 失败")
+		return nil, qqmusic.NewDataError(fmt.Sprintf("QQ 确认回跳未返回 p_skey（HTTP %d），请重新生成二维码", check.StatusCode))
 	}
-	authResp, err := m.cl.DoHTTPPlainContext(ctx, "POST", "https://graph.qq.com/oauth2.0/authorize", qqmusic.HTTPOption{
+	authResp, err := m.qqOAuthHTTP(ctx, "POST", "https://graph.qq.com/oauth2.0/authorize", qqmusic.HTTPOption{
 		FormBody: qqmusic.P(
 			"response_type", "code", "client_id", "100497308",
 			"redirect_uri", "https://y.qq.com/portal/wx_redirect.html?login_type=1&surl=https://y.qq.com/",
 			"scope", "get_user_info,get_app_friends", "state", "state", "switch", "",
 			"from_ptlogin", "1", "src", "1", "update_auth", "1", "openapi", "1010_1030",
 			"g_tk", strconv.FormatInt(qqmusic.Hash33(pSkey, 5381), 10),
-			"auth_time", fmt.Sprintf("%d000", time.Now().Unix()),
-			"ui", randomGUID()),
-		Cookies:    checkResp.Cookies,
-		NoRedirect: true,
+			"auth_time", strconv.FormatInt(time.Now().UnixMilli(), 10), "ui", randomGUID()),
+		Headers: map[string]string{"Referer": "https://graph.qq.com/", "Origin": "https://graph.qq.com"},
+	}, session, true)
+	if err != nil {
+		return nil, err
+	}
+	code := qqOAuthCode(authResp.Headers.Get("Location"))
+	if code == "" {
+		return nil, qqmusic.NewDataError("获取 QQ 授权码失败，请重新生成二维码")
+	}
+	// wx_redirect.html 在 qq.com 设置 login_type=1，并按 musicu 域实际可见的
+	// Cookie 计算 g_tk。graph.qq.com 的 p_skey 不应跨域塞给 musicu。
+	musicCookies := session.cookies("https://u.y.qq.com/cgi-bin/musicu.fcg")
+	musicCookies["login_type"] = "1"
+	gtk := int64(5381)
+	for _, name := range []string{"qqmusic_key", "p_skey", "skey", "p_lskey", "lskey"} {
+		if key := musicCookies[name]; key != "" {
+			gtk = qqmusic.Hash33(key, 5381)
+			break
+		}
+	}
+	item, err := m.cl.CgiCall("QQConnectLogin.LoginServer", "QQLogin", qqmusic.NewJObj().Set("code", code), qqmusic.CGIOption{
+		Platform: qqmusic.PlatformWeb, Credential: &qqmusic.Credential{},
+		Comm:    qqmusic.NewJObj().Set("tmeLoginType", 2).Set("cv", 0).Set("platform", "yqq").Set("g_tk", gtk).Set("g_tk_new_20200303", gtk),
+		Cookies: musicCookies, Headers: map[string]string{"Referer": "https://y.qq.com/", "Origin": "https://y.qq.com"},
+		AllowErrorCodes: allowLoginErrorCodes,
 	})
 	if err != nil {
 		return nil, err
 	}
-	location := authResp.Headers.Get("Location")
-	codeMatch := qqCodeRe.FindStringSubmatch(location)
-	if codeMatch == nil {
-		return nil, qqmusic.NewDataError("获取 code 失败")
-	}
-	item, err := m.loginCgi("QQConnectLogin.LoginServer", "QQLogin",
-		qqmusic.NewJObj().Set("code", codeMatch[1]),
-		qqmusic.NewJObj().Set("tmeLoginType", 2))
+	cred, err := validateLoginResponse(item)
 	if err != nil {
 		return nil, err
 	}
-	return validateLoginResponse(item)
+	if !cred.HasLogin() {
+		return nil, qqmusic.NewDataError("QQ 登录响应缺少有效凭证，请重新生成二维码")
+	}
+	return cred, nil
 }
 
 // ===================== 微信二维码 =====================

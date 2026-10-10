@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/team-quaver/typhoeus-go/qqmusic"
 	"github.com/team-quaver/typhoeus-go/qqmusic/modules"
@@ -60,6 +61,12 @@ func (a *App) handleUserVip(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, err)
 		return
 	}
+	var info modules.VipInfo
+	if err := json.Unmarshal(raw, &info); err != nil {
+		writeError(w, qqmusic.NewDataError("会员权益响应格式异常"))
+		return
+	}
+	raw, _ = json.Marshal(info.Active(time.Now()))
 	writeOK(w, normalizeVip(raw))
 }
 

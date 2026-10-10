@@ -161,3 +161,13 @@ func TestNormalizeAlbumSongsUsesAlbumOrder(t *testing.T) {
 		}
 	}
 }
+
+// 三类权益的独立时间字段必须完整交给前端；不能在兼容层丢掉。
+func TestNormalizeVipIndependentDates(t *testing.T) {
+	raw := json.RawMessage(`{"svip":0,"svip_start":"2025-01-01","svip_end":"2025-02-01","svip_year_flag":0,"identity":{"huge_vip":1,"huge_vip_start":"2026-01-01","huge_vip_end":"2026-11-01","vip":1,"vip_start":"2026-01-01","vip_end":"2026-12-01"}}`)
+	out := normalizeVip(raw)
+	id := out["identity"].(obj)
+	if out["svip_end"] != "2025-02-01" || id["huge_vip_end"] != "2026-11-01" || id["vip_end"] != "2026-12-01" {
+		t.Fatalf("expiry fields lost/mixed: %+v", out)
+	}
+}

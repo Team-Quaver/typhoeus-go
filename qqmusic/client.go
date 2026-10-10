@@ -40,9 +40,17 @@ type Client struct {
 	httpOnce sync.Once
 }
 
+// ClientOption 允许嵌入方提供 HTTP 客户端（也用于离线协议回归测试）。
+type ClientOption func(*Client)
+
+// WithHTTPClient 在构造时指定 HTTP 客户端；调用方负责其 Transport/超时配置。
+func WithHTTPClient(client *http.Client) ClientOption {
+	return func(cl *Client) { cl.http = client }
+}
+
 // NewClient 构造客户端。devicePath 为空则生成一次性内存设备；
 // 设备缓存路径缺省由 devicePath 派生（device.json → device.cache.json）。
-func NewClient(cred *Credential, devicePath, deviceCachePath string) (*Client, error) {
+func NewClient(cred *Credential, devicePath, deviceCachePath string, options ...ClientOption) (*Client, error) {
 	if cred == nil {
 		cred = &Credential{}
 	}
@@ -58,12 +66,18 @@ func NewClient(cred *Credential, devicePath, deviceCachePath string) (*Client, e
 		return nil, err
 	}
 	cl.device = dev
+	for _, option := range options {
+		option(cl)
+	}
 	return cl, nil
 }
 
 // httpClient 懒初始化 HTTP 池。
 func (cl *Client) httpClient() *http.Client {
 	cl.httpOnce.Do(func() {
+		if cl.http != nil {
+			return
+		}
 		cl.http = &http.Client{
 			Timeout: 35 * time.Second,
 			Transport: &http.Transport{
@@ -195,6 +209,8 @@ type CGIOption struct {
 	// PreserveBool=true 时参数里的布尔保持 JSON true/false；
 	// 缺省按上游 bool_to_int 语义递归转成 0/1（与 vendor 实现一致）。
 	PreserveBool bool
+	Cookies      map[string]string // 请求级 Cookie（QQ OAuth 换码使用，不写入共享客户端）
+	Headers      map[string]string
 }
 
 // CgiCall 发起一次 CGI 调用，返回子响应原文（json.RawMessage，含 code/data）。
@@ -233,7 +249,7 @@ func (cl *Client) CgiCall(module, method string, param *JObj, opt CGIOption) (js
 
 	body := payload.Marshal()
 	if os.Getenv("QSG_DEBUG_CGI") != "" {
-		fmt.Fprintln(os.Stderr, "[CGI]", module, method, string(body))
+		fmt.Fprintln(os.Stderr, "[CGI]", module, method, "payload_bytes=", len(body))
 	}
 	rawURL := musicuURL
 	if opt.Sign {
@@ -245,6 +261,21 @@ func (cl *Client) CgiCall(module, method string, param *JObj, opt CGIOption) (js
 		return nil, err
 	}
 	req.Header.Set("User-Agent", cl.UserAgent(platform))
+	for k, v := range opt.Headers {
+		req.Header.Set(k, v)
+	}
+	// Web/desktop CGI 依赖 Cookie 鉴权；只有 comm.uin/g_tk 并不携带登录凭证。
+	// 请求级 Cookie 覆盖同名值，QQ OAuth 用空 Credential，避免串入旧账号。
+	cookies := map[string]string{}
+	if platform != PlatformAndroid {
+		cookies = credentialCookies(cred)
+	}
+	for k, v := range opt.Cookies {
+		cookies[k] = v
+	}
+	for k, v := range cookies {
+		req.AddCookie(&http.Cookie{Name: k, Value: v})
+	}
 	resp, respBody, err := cl.doRequest(req, 15*time.Second, false)
 	if err != nil {
 		return nil, err
@@ -394,27 +425,16 @@ func (cl *Client) DoHTTPPlainContext(ctx context.Context, method, rawURL string,
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", cl.UserAgent(PlatformWeb))
 	}
-	// 凭证 Cookie + 请求级 Cookie
 	cred := opt.Credential
 	if cred == nil {
 		cred = cl.Credential()
 	}
-	var cookieParts []string
-	if cred.MusicID != 0 {
-		uin := cred.StrMusicID
-		if uin == "" {
-			uin = strconv.FormatInt(cred.MusicID, 10)
-		}
-		cookieParts = append(cookieParts, "uin="+uin, "qqmusic_uin="+uin)
-	}
-	if cred.MusicKey != "" {
-		cookieParts = append(cookieParts, "qm_keyst="+cred.MusicKey, "qqmusic_key="+cred.MusicKey)
-	}
+	cookies := credentialCookies(cred)
 	for k, v := range opt.Cookies {
-		cookieParts = append(cookieParts, k+"="+v)
+		cookies[k] = v
 	}
-	if len(cookieParts) > 0 {
-		req.Header.Set("Cookie", strings.Join(cookieParts, "; "))
+	for k, v := range cookies {
+		req.AddCookie(&http.Cookie{Name: k, Value: v})
 	}
 
 	timeout := 15 * time.Second
@@ -436,6 +456,25 @@ func (cl *Client) DoHTTPPlainContext(ctx context.Context, method, rawURL string,
 		snap.Cookies[c.Name] = c.Value
 	}
 	return snap, nil
+}
+
+// credentialCookies 返回独立 map，不修改共享凭证，不保留请求级 OAuth Cookie。
+func credentialCookies(cred *Credential) map[string]string {
+	cookies := map[string]string{}
+	if cred.MusicID != 0 {
+		uin := cred.StrMusicID
+		if uin == "" {
+			uin = strconv.FormatInt(cred.MusicID, 10)
+		}
+		cookies["uin"], cookies["qqmusic_uin"] = uin, uin
+	}
+	if cred.MusicKey != "" {
+		cookies["qm_keyst"], cookies["qqmusic_key"] = cred.MusicKey, cred.MusicKey
+	}
+	if cred.LoginType != 0 {
+		cookies["tmeLoginType"] = strconv.FormatInt(cred.LoginType, 10)
+	}
+	return cookies
 }
 
 func orInit(m map[string]string) map[string]string {

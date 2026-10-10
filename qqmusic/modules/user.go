@@ -38,14 +38,46 @@ func (m *UserModule) GetHomepageHeader(euin string) (json.RawMessage, error) {
 	return qqmusic.ParseCGIData(data, nil)
 }
 
-// GetVipInfo 当前账号 VIP 信息（require_login）。
+// GetVipInfo 优先使用 Web 会员页查询。uin_list 是 string[]（官方将 UIN 转成字符串），
+// 传入 JSON number 会返回参数错误 10006。接口暂时不可用时，
+// 回退到原有登录权益接口，并按真实含义映射，不能将旧 svip 当成超级会员。
 func (m *UserModule) GetVipInfo() (json.RawMessage, error) {
-	data, err := m.cl.CgiCall("VipLogin.VipLoginInter", "vip_login_base", qqmusic.NewJObj(),
-		qqmusic.CGIOption{RequireLogin: true})
+	cred := m.cl.Credential()
+	data, err := m.cl.CgiCall("userInfo.VipQueryServer", "SRFVipQuery_V2",
+		qqmusic.NewJObj().Set("uin_list", &qqmusic.JArr{strconv.FormatInt(cred.MusicID, 10)}),
+		qqmusic.CGIOption{RequireLogin: true, Credential: cred, Platform: qqmusic.PlatformWeb,
+			Comm:    qqmusic.NewJObj().Set("cv", 0).Set("platform", "yqq").Set("tmeAppID", "qqmusic").Set("tmeLoginType", cred.LoginType),
+			Headers: map[string]string{"Referer": "https://y.qq.com/", "Origin": "https://y.qq.com"}})
+	var info VipInfo
+	if err == nil {
+		data, err = qqmusic.ParseCGIData(data, nil)
+	}
+	if err == nil {
+		info, err = parseVipQuery(data, cred.MusicID)
+	}
+	if err == nil {
+		return json.Marshal(info)
+	}
+	// 凭证错误交给会话层刷新，不通过重试掩盖过期或绕过限流。
+	kind := qqmusic.AsAPIError(err).Kind
+	if kind == qqmusic.ErrKindCredentialInvalid || kind == qqmusic.ErrKindCredentialExpired || kind == qqmusic.ErrKindRatelimited {
+		return nil, err
+	}
+	logWarn("会员 Web 查询失败 (code=%d)，尝试登录权益接口", qqmusic.AsAPIError(err).Code)
+	data, err = m.cl.CgiCall("VipLogin.VipLoginInter", "vip_login_base", qqmusic.NewJObj(),
+		qqmusic.CGIOption{RequireLogin: true, Credential: cred})
 	if err != nil {
 		return nil, err
 	}
-	return qqmusic.ParseCGIData(data, nil)
+	data, err = qqmusic.ParseCGIData(data, nil)
+	if err != nil {
+		return nil, err
+	}
+	info, err = parseVipLogin(data)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(info)
 }
 
 // GetFavSong 「我喜欢」歌曲列表（dirid=201，分页）。

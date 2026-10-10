@@ -60,7 +60,11 @@ func newToken() string {
 // 当前账号可播档位（会员门控数据源）。加密档位会出现（本后端支持解密播放），
 // 用 encrypted 字段区分——UI 可标「解密播放」徽标。
 func (a *App) handleStreamTiers(w http.ResponseWriter, r *http.Request) {
-	membership := a.provider.Membership(r.Context())
+	membership, err := a.provider.Membership(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	available := typhoeus.AvailableFor(membership)
 	tiers := make([]map[string]any, 0, len(available))
 	for _, t := range available {

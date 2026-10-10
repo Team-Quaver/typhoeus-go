@@ -39,11 +39,14 @@ type QQMusicProvider struct {
 	song *modules.SongModule
 	user *modules.UserModule
 
-	mu           sync.Mutex
-	membership   Membership
-	membershipAt int64
-	cdnDomains   []string
-	cdnDomainsAt int64
+	mu                sync.Mutex
+	membershipInfo    modules.VipInfo
+	membershipAt      int64
+	membershipRetryAt int64
+	membershipErr     error
+	membershipAccount int64
+	cdnDomains        []string
+	cdnDomainsAt      int64
 }
 
 // NewQQMusicProvider 构造。
@@ -59,60 +62,69 @@ func NewQQMusicProvider(cl *qqmusic.Client) *QQMusicProvider {
 func (p *QQMusicProvider) InvalidateMembership() {
 	p.mu.Lock()
 	p.membershipAt = 0
+	p.membershipRetryAt = 0
+	p.membershipErr = nil
+	p.membershipAccount = 0
+	p.membershipInfo = modules.VipInfo{}
 	p.mu.Unlock()
 }
 
-// Membership 当前会员等级（带 10 分钟缓存；未登录/查询失败按最低门槛处理）。
-func (p *QQMusicProvider) Membership(ctx context.Context) Membership {
+// Membership 查询失败不是「无会员」。成功缓存 10 分钟，失败最多 15 秒后重试。
+// 刷新失败时只短暂保留同账号已验证的权益，仍逐次校验到期；首次失败明确报错。
+func (p *QQMusicProvider) Membership(ctx context.Context) (Membership, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	now := time.Now().Unix()
-	if p.membershipAt > 0 && now-p.membershipAt < membershipTTL {
-		return p.membership
+	cred := p.cl.Credential()
+	if !cred.HasLogin() {
+		return MembershipNone, nil
 	}
-	level := p.fetchMembership(ctx)
-	p.membership = level
-	p.membershipAt = now
-	logf("membership 判定: %s", level)
-	return level
+	if cred.MusicID != p.membershipAccount {
+		p.membershipInfo, p.membershipAt, p.membershipRetryAt = modules.VipInfo{}, 0, 0
+		p.membershipErr, p.membershipAccount = nil, cred.MusicID
+	}
+	now := time.Now()
+	if (p.membershipAt == 0 || now.Unix()-p.membershipAt >= membershipTTL) && now.Unix() >= p.membershipRetryAt {
+		info, err := p.fetchMembership(ctx)
+		if err != nil {
+			p.membershipErr, p.membershipRetryAt = err, now.Unix()+15
+		} else {
+			p.membershipInfo, p.membershipAt = info, now.Unix()
+			p.membershipErr, p.membershipRetryAt = nil, 0
+		}
+	}
+	if p.membershipErr != nil {
+		kind := qqmusic.AsAPIError(p.membershipErr).Kind
+		// 凭证过期时不使用缓存；无有效缓存也不把一次接口失败写成普通用户。
+		if p.membershipAt == 0 || now.Unix()-p.membershipAt >= 2*membershipTTL ||
+			kind == qqmusic.ErrKindCredentialInvalid || kind == qqmusic.ErrKindCredentialExpired {
+			return MembershipNone, errProvider("会员权益查询暂时失败，请稍后重试（未更改账号会员等级）")
+		}
+	}
+	return membershipFromInfo(p.membershipInfo, now), nil
 }
 
-// fetchMembership 实时查询。
-// 区分「未登录」与「登录但非会员」：未登录直接 0，省一次必然失败的请求。
-func (p *QQMusicProvider) fetchMembership(ctx context.Context) Membership {
-	if !p.cl.Credential().HasLogin() {
-		logf("membership: 未登录，判普通用户")
-		return MembershipNone
-	}
-	raw, err := p.user.GetVipInfo()
-	if err != nil {
-		// 拿不到会员信息按最低门槛处理：档位请求仍可能成功（免费曲可播低档）
-		logf("membership: GetVipInfo 失败，按最低门槛处理: %v", err)
-		return MembershipNone
-	}
-	var vip struct {
-		Svip     int64 `json:"svip"`
-		HugeVip  int64 `json:"huge_vip"`
-		Identity struct {
-			Vip     int64 `json:"vip"`
-			HugeVip int64 `json:"huge_vip"`
-		} `json:"identity"`
-	}
-	if err := json.Unmarshal(raw, &vip); err != nil {
-		logf("membership: 响应解析失败，按最低门槛处理")
-		return MembershipNone
-	}
-	if vip.Svip != 0 {
+func membershipFromInfo(info modules.VipInfo, now time.Time) Membership {
+	info = info.Active(now)
+	if info.Svip == 1 {
 		return MembershipSuper
 	}
-	if vip.HugeVip != 0 || vip.Identity.HugeVip != 0 || vip.Identity.Vip != 0 {
+	if info.Identity.HugeVip == 1 || info.Identity.Vip == 1 {
 		return MembershipGreen
 	}
-	// 全零诊断：上游这条 CGI 的字段命名风格不稳定（snake_case/驼峰混用），
-	// 键名不匹配时 Go 的 json 会静默读零 → 判普通用户 → 高阶全被本地门控拦掉。
-	// 打出顶层键名供对风格（键名非敏感值）。
-	logf("membership: 响应无任何会员标记，判普通用户（顶层键: %s）", topKeys(raw))
 	return MembershipNone
+}
+
+// fetchMembership 只有有效响应才表示会员状态，不能把错误改成零值权益。
+func (p *QQMusicProvider) fetchMembership(ctx context.Context) (modules.VipInfo, error) {
+	raw, err := p.user.GetVipInfo()
+	if err != nil {
+		return modules.VipInfo{}, err
+	}
+	var info modules.VipInfo
+	if err := json.Unmarshal(raw, &info); err != nil {
+		return modules.VipInfo{}, qqmusic.NewDataError("会员权益响应格式异常")
+	}
+	return info, nil
 }
 
 // topKeys 响应顶层键名（诊断用；解析失败返回 "?"）。

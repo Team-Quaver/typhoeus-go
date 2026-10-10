@@ -118,10 +118,10 @@ func firstOf(o obj, keys ...string) any {
 	return nil
 }
 
-func strOf(o obj, keys ...string) string  { return sval(firstOf(o, keys...)) }
-func numOf(o obj, keys ...string) int64   { return nval(firstOf(o, keys...)) }
-func boolOf(o obj, keys ...string) bool   { return bval(firstOf(o, keys...)) }
-func objOf(o obj, key string) obj         { return asObj(o[key]) }
+func strOf(o obj, keys ...string) string { return sval(firstOf(o, keys...)) }
+func numOf(o obj, keys ...string) int64  { return nval(firstOf(o, keys...)) }
+func boolOf(o obj, keys ...string) bool  { return bval(firstOf(o, keys...)) }
+func objOf(o obj, key string) obj        { return asObj(o[key]) }
 func arrOf(o obj, keys ...string) arr {
 	if o == nil {
 		return arr{}
@@ -400,10 +400,10 @@ func normalizeCreatedSonglists(raw json.RawMessage) obj {
 		playlists = append(playlists, songlistItem(asObj(it)))
 	}
 	return obj{
-		"total":      numOf(d, "total"),
-		"playlists":  playlists,
-		"hasmore":    boolOf(d, "hasmore"),
-		"finished":   d["finished"],
+		"total":       numOf(d, "total"),
+		"playlists":   playlists,
+		"hasmore":     boolOf(d, "hasmore"),
+		"finished":    d["finished"],
 		"deleted_ids": d["deleted_ids"],
 	}
 }
@@ -427,22 +427,24 @@ func normalizeFavSonglists(raw json.RawMessage) obj {
 func normalizeLyric(raw json.RawMessage) obj {
 	d := decodeObj(raw)
 	out := obj{
-		"songid":          numOf(d, "songID", "songid"),
-		"lyric":           decodeLyricField(d["lyric"]),
-		"trans":           decodeLyricField(d["trans"]),
-		"roma":            decodeLyricField(d["roma"]),
+		"songid":                    numOf(d, "songID", "songid"),
+		"lyric":                     decodeLyricField(d["lyric"]),
+		"trans":                     decodeLyricField(d["trans"]),
+		"roma":                      decodeLyricField(d["roma"]),
 		"singing_annotations_lyric": decodeLyricField(firstOf(d, "singingAnnotationsLyric")),
-		"lrc_t":           numOf(d, "lrc_t"),
-		"qrc_t":           numOf(d, "qrc_t"),
-		"trans_t":         numOf(d, "trans_t"),
-		"roma_t":          numOf(d, "roma_t"),
-		"has_contributor": boolOf(d, "hasContributor"),
-		"qrc":             d["qrc"],
+		"lrc_t":                     numOf(d, "lrc_t"),
+		"qrc_t":                     numOf(d, "qrc_t"),
+		"trans_t":                   numOf(d, "trans_t"),
+		"roma_t":                    numOf(d, "roma_t"),
+		"has_contributor":           boolOf(d, "hasContributor"),
+		"qrc":                       d["qrc"],
 	}
 	return out
 }
 
-// —— VIP 信息（UserVipInfoResponse：identity / userinfo 两层嵌套）——
+// —— VIP 信息（稳定权益契约 + 历史 SDK 别名兼容）——
+// 当前输入来自 modules.VipInfo：svip = 超级会员，identity.huge_vip = 豪华绿钻。
+// 不可直接把旧 vip_login_base 原文交给 UI；旧 CGI 的 svip/HugeVip 语义不同。
 //
 // 上游这条 CGI 的字段命名风格不稳定：同一份语义在不同账号/版本下既有 snake_case
 // （huge_vip_end，2026-09-19 抓包实测）、也有驼峰/小写连写（HugeVipEnd、starend、
@@ -458,7 +460,7 @@ func normalizeVip(raw json.RawMessage) obj {
 	out := obj{}
 
 	// 顶层（UserVipInfoResponse）：svip/star 等无别名的字段直接保留
-	for _, k := range []string{"svip", "star", "ystar", "identity", "userinfo"} {
+	for _, k := range []string{"svip", "svip_start", "svip_end", "svip_year_flag", "star", "ystar", "identity", "userinfo"} {
 		if v, ok := d[k]; ok && v != nil {
 			out[k] = v
 		}
@@ -479,7 +481,7 @@ func normalizeVip(raw json.RawMessage) obj {
 	// huge_vip 系/year_flag 没有别名歧义，走下方别名链（小写优先）统一搬运。
 	id := objOf(d, "identity")
 	nid := obj{}
-	for _, k := range []string{"vip", "twelve", "eight", "level", "icon"} {
+	for _, k := range []string{"vip", "vip_start", "vip_end", "twelve", "eight", "level", "icon"} {
 		if v, ok := id[k]; ok && v != nil {
 			nid[k] = v
 		}
@@ -508,7 +510,7 @@ func normalizeVip(raw json.RawMessage) obj {
 	)
 	out["identity"] = nid
 
-	// userinfo（VipUserInfo）：权益摘要（expire 是前端「会员有效至」的兜底字段）
+	// userinfo（VipUserInfo）：保留历史摘要字段，expire 不用于独立权益的到期判断。
 	ui := objOf(d, "userinfo")
 	nui := obj{}
 	for _, k := range []string{"score", "expire"} {
