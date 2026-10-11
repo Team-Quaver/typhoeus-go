@@ -447,12 +447,14 @@ func (a *App) handleSonglistFavCheck(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, err)
 		return
 	}
+	// 必须先 normalize：原始响应用 v_list，不是 playlists。
+	nb, _ := json.Marshal(normalizeFavSonglists(raw))
 	var resp struct {
 		Playlists []struct {
 			ID int64 `json:"id"`
 		} `json:"playlists"`
 	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
+	if err := json.Unmarshal(nb, &resp); err != nil {
 		writeError(w, qqmusic.NewDataError("收藏歌单解析失败"))
 		return
 	}
