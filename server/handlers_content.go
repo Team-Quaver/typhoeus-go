@@ -95,7 +95,12 @@ func (a *App) handleUserCreatedSonglists(w http.ResponseWriter, _ *http.Request)
 		return
 	}
 	raw, err := a.call(false, func() (json.RawMessage, error) {
-		return a.user.GetCreatedSonglist(fmt.Sprintf("%d", cred.MusicID))
+		// 自建歌单主键：优先精确的 StrMusicID（长 wx uin 场景 MusicID 可能丢精度）。
+		uin := cred.StrMusicID
+		if uin == "" {
+			uin = fmt.Sprintf("%d", cred.MusicID)
+		}
+		return a.user.GetCreatedSonglist(uin)
 	})
 	if err != nil {
 		writeError(w, err)

@@ -40,6 +40,27 @@ func Hash33(s string, h int64) int64 {
 	return 2147483647 & h
 }
 
+
+// credentialUin 凭证的数字 uin 字符串。优先精确的 StrMusicID
+// （长 wx uin 超过 float64 安全整数时 MusicID 可能已丢精度）。
+func credentialUin(c *Credential) (string, bool) {
+	if c.StrMusicID != "" {
+		return c.StrMusicID, true
+	}
+	if c.MusicID != 0 {
+		return strconv.FormatInt(c.MusicID, 10), true
+	}
+	return "", false
+}
+
+// credentialUinOrZero 同上，取不到时回 "0"（web comm 恒带 uin 字段）。
+func credentialUinOrZero(c *Credential) string {
+	if uin, ok := credentialUin(c); ok {
+		return uin
+	}
+	return "0"
+}
+
 // GTK 计算 CSRF token（web/desktop comm 用）。
 func GTK(c *Credential) int64 {
 	if c.MusicKey != "" {
@@ -61,8 +82,8 @@ func (cl *Client) BuildComm(platform Platform, c *Credential) *JObj {
 		p.Set("cv", strconv.FormatInt(profile.cv, 10))
 		p.Set("v", strconv.FormatInt(profile.v, 10))
 		p.Set("chid", "10003505")
-		if c.MusicID != 0 {
-			p.Set("qq", strconv.FormatInt(c.MusicID, 10))
+		if uin, ok := credentialUin(c); ok {
+			p.Set("qq", uin)
 		}
 		if c.MusicKey != "" {
 			p.Set("authst", c.MusicKey)
@@ -87,8 +108,8 @@ func (cl *Client) BuildComm(platform Platform, c *Credential) *JObj {
 		p.Set("ct", strconv.FormatInt(profile.ct, 10))
 		p.Set("cv", strconv.FormatInt(profile.cv, 10))
 		p.Set("chid", "0")
-		if c.MusicID != 0 {
-			p.Set("uin", strconv.FormatInt(c.MusicID, 10))
+		if uin, ok := credentialUin(c); ok {
+			p.Set("uin", uin)
 		}
 		p.Set("g_tk", strconv.FormatInt(GTK(c), 10))
 		p.Set("guid", strings.ToUpper(cl.device.OpenUDID))
@@ -97,7 +118,7 @@ func (cl *Client) BuildComm(platform Platform, c *Credential) *JObj {
 		p.Set("cv", strconv.FormatInt(profile.cv, 10))
 		p.Set("platform", profile.platform)
 		p.Set("chid", "0")
-		p.Set("uin", strconv.FormatInt(c.MusicID, 10))
+		p.Set("uin", credentialUinOrZero(c))
 		gtk := strconv.FormatInt(GTK(c), 10)
 		p.Set("g_tk", gtk)
 		p.Set("g_tk_new_20200303", gtk)

@@ -2,7 +2,6 @@ package modules
 
 import (
 	"encoding/json"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,14 +32,17 @@ type VipIdentity struct {
 
 // parseVipQuery 对齐官方 myservice 页：HugeVip = 超会，iSuperVip = 绿豪，
 // iVipFlag = 绿钻；superStart/EndTime 属于绿豪，HugeVipStart/End 属于超会。
-func parseVipQuery(data json.RawMessage, uin int64) (VipInfo, error) {
+// uin 必须与请求侧 uin_list 用同一个字符串 —— 存档凭证里的 MusicID 可能是
+// 旧版本解析丢精度后的坏值，按数字回拼会查不到自己的条目。
+func parseVipQuery(data json.RawMessage, uin string) (VipInfo, error) {
 	var response struct {
 		InfoMap map[string]map[string]any `json:"infoMap"`
 	}
 	if err := json.Unmarshal(data, &response); err != nil {
 		return VipInfo{}, qqmusic.NewDataError("会员权益响应格式异常")
 	}
-	v := response.InfoMap[strconv.FormatInt(uin, 10)]
+	// 严格 key 匹配：请求只带一个 uin，回显里有谁都不许碰别人的条目。
+	v := response.InfoMap[uin]
 	if len(v) == 0 || (v["HugeVip"] == nil && v["iSuperVip"] == nil && v["iVipFlag"] == nil) {
 		return VipInfo{}, qqmusic.NewDataError("会员权益响应缺少当前账号")
 	}

@@ -461,7 +461,9 @@ func (cl *Client) DoHTTPPlainContext(ctx context.Context, method, rawURL string,
 // credentialCookies 返回独立 map，不修改共享凭证，不保留请求级 OAuth Cookie。
 func credentialCookies(cred *Credential) map[string]string {
 	cookies := map[string]string{}
-	if cred.MusicID != 0 {
+	// 优先精确的 StrMusicID：MusicID 若在解析层丢过精度（长 wx uin），
+	// 这里再按它生成 Cookie 会整体鉴权失败。
+	if cred.MusicID != 0 || cred.StrMusicID != "" {
 		uin := cred.StrMusicID
 		if uin == "" {
 			uin = strconv.FormatInt(cred.MusicID, 10)

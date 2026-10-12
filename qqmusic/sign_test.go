@@ -61,6 +61,31 @@ func TestCredentialJSONCompat(t *testing.T) {
 	}
 }
 
+// 微信 uin 是长整数，超过 float64 安全整数（2^53）。解析必须精确到个位。
+func TestCredentialBigMusicIDPrecision(t *testing.T) {
+	const wxUin = int64(9207153850012345678)
+	raw := []byte(`{"musicid":9207153850012345678,"str_musicid":"9207153850012345678",
+		"musickey":"W_X_YY","login_type":1}`)
+	var c Credential
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.MusicID != wxUin {
+		t.Fatalf("musicid 精度丢失: got %d want %d", c.MusicID, wxUin)
+	}
+	if c.StrMusicID != "9207153850012345678" {
+		t.Fatalf("str_musicid 解析失败: %q", c.StrMusicID)
+	}
+	// 字符串形态的 musicid（上游部分接口会吐字符串）也要能读
+	var c2 Credential
+	if err := json.Unmarshal([]byte(`{"musicid":"9207153850012345678","musickey":"W_X_YY"}`), &c2); err != nil {
+		t.Fatal(err)
+	}
+	if c2.MusicID != wxUin {
+		t.Fatalf("字符串 musicid 解析失败: got %d", c2.MusicID)
+	}
+}
+
 func TestHash33(t *testing.T) {
 	// 手算：h=5381 → *33+'a' → *33+'b' → *33+'c'
 	if got := Hash33("abc", 5381); got != 193485963 {

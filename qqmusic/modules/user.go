@@ -44,7 +44,7 @@ func (m *UserModule) GetHomepageHeader(euin string) (json.RawMessage, error) {
 func (m *UserModule) GetVipInfo() (json.RawMessage, error) {
 	cred := m.cl.Credential()
 	data, err := m.cl.CgiCall("userInfo.VipQueryServer", "SRFVipQuery_V2",
-		qqmusic.NewJObj().Set("uin_list", &qqmusic.JArr{strconv.FormatInt(cred.MusicID, 10)}),
+		qqmusic.NewJObj().Set("uin_list", &qqmusic.JArr{credentialNumericUin(cred)}),
 		qqmusic.CGIOption{RequireLogin: true, Credential: cred, Platform: qqmusic.PlatformWeb,
 			Comm:    qqmusic.NewJObj().Set("cv", 0).Set("platform", "yqq").Set("tmeAppID", "qqmusic").Set("tmeLoginType", cred.LoginType),
 			Headers: map[string]string{"Referer": "https://y.qq.com/", "Origin": "https://y.qq.com"}})
@@ -53,7 +53,7 @@ func (m *UserModule) GetVipInfo() (json.RawMessage, error) {
 		data, err = qqmusic.ParseCGIData(data, nil)
 	}
 	if err == nil {
-		info, err = parseVipQuery(data, cred.MusicID)
+		info, err = parseVipQuery(data, credentialNumericUin(cred))
 	}
 	if err == nil {
 		return json.Marshal(info)
@@ -78,6 +78,16 @@ func (m *UserModule) GetVipInfo() (json.RawMessage, error) {
 		return nil, err
 	}
 	return json.Marshal(info)
+}
+
+
+// credentialNumericUin 会员查询用数字 uin：优先精确的 StrMusicID，
+// 防 MusicID 解析丢精度后查到别人的会员状态。
+func credentialNumericUin(c *qqmusic.Credential) string {
+	if c.StrMusicID != "" {
+		return c.StrMusicID
+	}
+	return strconv.FormatInt(c.MusicID, 10)
 }
 
 // GetFavSong 「我喜欢」歌曲列表（dirid=201，分页）。

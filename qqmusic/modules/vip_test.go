@@ -12,7 +12,7 @@ import (
 
 func TestVipQueryIndependentEntitlements(t *testing.T) {
 	raw := json.RawMessage(`{"infoMap":{"123":{"HugeVip":0,"HugeVipStart":"2025-01-01","HugeVipEnd":"2025-02-01","iSuperVip":"1","superStartTime":"2026-01-01","superEndTime":"2026-11-01","iVipFlag":1,"sStartDateTime":"2026-01-01","sOverDateTime":"2026-12-01","iCurLevel":6}}}`)
-	v, err := parseVipQuery(raw, 123)
+	v, err := parseVipQuery(raw, "123")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,7 +22,7 @@ func TestVipQueryIndependentEntitlements(t *testing.T) {
 	if v.SvipEnd != "2025-02-01" || v.Identity.HugeVipEnd != "2026-11-01" || v.Identity.VipEnd != "2026-12-01" {
 		t.Fatalf("mixed expiration dates: %+v", v)
 	}
-	if _, err := parseVipQuery(raw, 456); err == nil {
+	if _, err := parseVipQuery(raw, "456"); err == nil {
 		t.Fatal("must not use another account's info")
 	}
 }

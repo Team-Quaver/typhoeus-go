@@ -62,40 +62,64 @@ var credentialAliasMap = map[string]string{
 	"login_type":           "login_type",
 }
 
+// stringCredentialFields JSON 里以字符串形态出现的凭证字段。
+var stringCredentialFields = map[string]bool{
+	"openid": true, "refresh_token": true, "access_token": true, "musickey": true,
+	"unionid": true, "str_musicid": true, "refresh_key": true, "encrypt_uin": true,
+}
+
 // UnmarshalJSON 兼容 snake/camel 两种字段名。
+//
+// 数字字段严禁经 float64 中转：微信 uin 是长整数，超过 2^53 后
+// any(float64) → int64 会静默丢精度，导致后续所有带 uin 的请求
+// （comm.uin/qq、Cookie、uin_list）拿着错误的 uin 鉴权。
+// 这里按 RawMessage 原样取值，数字字面量走 json.Number → ParseInt 精确转换。
 func (c *Credential) UnmarshalJSON(data []byte) error {
-	var raw map[string]any
+	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	var zero Credential
 	for k, v := range raw {
 		name, ok := credentialAliasMap[k]
 		if !ok {
 			continue
 		}
-		var num int64
-		switch x := v.(type) {
-		case string:
-			switch name {
-			case "openid", "refresh_token", "access_token", "musickey", "unionid",
-				"str_musicid", "refresh_key", "encrypt_uin":
-				setStringField(c, name, x)
-				continue
-			default:
-				num, _ = strconv.ParseInt(x, 10, 64)
+		if stringCredentialFields[name] {
+			var s string
+			if err := json.Unmarshal(v, &s); err == nil {
+				setStringField(c, name, s)
 			}
-		case float64:
-			num = int64(x)
-		case bool:
-			if x {
-				num = 1
-			}
+			continue
 		}
-		setIntField(c, name, num)
+		if num, ok := parseCredentialInt(v); ok {
+			setIntField(c, name, num)
+		}
 	}
-	_ = zero
 	return nil
+}
+
+// parseCredentialInt 数值字段宽容解析：字符串/整数/浮点/布尔都收，
+// 整数字面量（含大数）走 json.Number 保持精确。
+func parseCredentialInt(v json.RawMessage) (int64, bool) {
+	var s string
+	if err := json.Unmarshal(v, &s); err == nil {
+		n, err := strconv.ParseInt(s, 10, 64)
+		return n, err == nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(v, &n); err == nil {
+		if i, err := n.Int64(); err == nil {
+			return i, true
+		}
+		if f, err := n.Float64(); err == nil {
+			return int64(f), true
+		}
+	}
+	var b bool
+	if err := json.Unmarshal(v, &b); err == nil && b {
+		return 1, true
+	}
+	return 0, false
 }
 
 func setStringField(c *Credential, name, v string) {
