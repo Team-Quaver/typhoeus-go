@@ -40,6 +40,26 @@ func (m *RecommendModule) GetRecommendSonglist(page, num int) (json.RawMessage, 
 	return qqmusic.ParseCGIData(data, nil)
 }
 
+// aiPlaylistCategoryID 网页版「AI歌单」分类（y.qq.com/n/ryqq_v2/category?t1=9527）。
+const aiPlaylistCategoryID = 9527
+
+// GetAISonglist AI 歌单分类（分页）。网页版在 source=1 的分类上把
+// PlayListCategory 的 get_category_content 覆写成 AiPlCategory 的同名方法，
+// 这里直接调用覆写后的模块，避免拿到普通分类歌单。
+func (m *RecommendModule) GetAISonglist(page, num int) (json.RawMessage, error) {
+	param := qqmusic.NewJObj().
+		Set("caller", credentialNumericUin(m.cl.Credential())).
+		Set("category_id", aiPlaylistCategoryID).
+		Set("size", num).
+		Set("page", page-1).
+		Set("use_page", 1)
+	data, err := m.cl.CgiCall("music.playlist.AiPlCategory", "get_ai_category_content", param, qqmusic.CGIOption{})
+	if err != nil {
+		return nil, err
+	}
+	return qqmusic.ParseCGIData(data, nil)
+}
+
 // GetRecommendNewsong 推荐新歌（type: 1内地 2欧美 3日本 4韩国 5最新 6港台）。
 func (m *RecommendModule) GetRecommendNewsong(typ int) (json.RawMessage, error) {
 	param := qqmusic.NewJObj().Set("type", typ)
@@ -56,24 +76,27 @@ type TopModule struct{ cl *qqmusic.Client }
 // NewTopModule 构造。
 func NewTopModule(cl *qqmusic.Client) *TopModule { return &TopModule{cl: cl} }
 
-// GetCategory 所有榜单分类。
+// GetCategory 所有榜单分类（与 y.qq.com/n/ryqq_v2/toplist 同一路 CGI）。
 func (m *TopModule) GetCategory() (json.RawMessage, error) {
-	data, err := m.cl.CgiCall("music.musicToplist.Toplist", "GetAll", qqmusic.NewJObj(), qqmusic.CGIOption{})
+	data, err := m.cl.CgiCall("musicToplist.ToplistInfoServer", "GetAll", qqmusic.NewJObj(), qqmusic.CGIOption{})
 	if err != nil {
 		return nil, err
 	}
 	return qqmusic.ParseCGIData(data, nil)
 }
 
-// GetDetail 榜单详情 + 歌曲列表（withTags 保持布尔原样）。
-func (m *TopModule) GetDetail(topID, page, num int64) (json.RawMessage, error) {
+// GetDetail 榜单详情 + 歌曲列表。period 为空时取当前期；历史期次由
+// GetAll 返回的 history.year / history.subPeriod 组合出来（周榜为 YYYY_W，
+// 日榜为 YYYY-MM-DD，实时榜为 YYYYMMDDHH）。
+func (m *TopModule) GetDetail(topID, page, num int64, period string) (json.RawMessage, error) {
 	param := qqmusic.NewJObj().
-		Set("topId", topID).
+		Set("topid", topID).
 		Set("offset", num*(page-1)).
-		Set("num", num).
-		Set("withTags", true)
-	data, err := m.cl.CgiCall("music.musicToplist.Toplist", "GetDetail", param,
-		qqmusic.CGIOption{PreserveBool: true})
+		Set("num", num)
+	if period != "" {
+		param.Set("period", period)
+	}
+	data, err := m.cl.CgiCall("musicToplist.ToplistInfoServer", "GetDetail", param, qqmusic.CGIOption{})
 	if err != nil {
 		return nil, err
 	}

@@ -143,6 +143,7 @@ func (a *App) Routes() *http.ServeMux {
 	// 推荐 / 榜单
 	mux.HandleFunc("GET /recommend/guess", a.handleRecommendGuess)
 	mux.HandleFunc("GET /recommend/songlist", a.handleRecommendSonglist)
+	mux.HandleFunc("GET /recommend/ai-songlist", a.handleRecommendAISonglist)
 	mux.HandleFunc("GET /recommend/newsong", a.handleRecommendNewsong)
 	mux.HandleFunc("GET /recommend/daily", a.handleRecommendDaily)
 	mux.HandleFunc("GET /top/category", a.handleTopCategory)

@@ -380,6 +380,171 @@ func normalizeRecommendSonglists(raw json.RawMessage) obj {
 	return obj{"songlists": out}
 }
 
+// —— 排行榜分类（musicToplist.ToplistInfoServer GetAll）——
+// 网页版榜单页把「分类 → 榜单 → 当前期卡片」放在 group[].toplist[] 里。
+// 首页只吃卡片需要的字段；history 归一成 year/sub_period，客户端据此生成近三个月可选期次。
+func normalizeTopCategories(raw json.RawMessage) obj {
+	d := decodeObj(raw)
+	groups := arr{}
+	for _, gv := range arrOf(d, "group") {
+		g := asObj(gv)
+		toplists := arr{}
+		for _, tv := range arrOf(g, "toplist") {
+			m := asObj(tv)
+			id := numOf(m, "topId", "topid", "id")
+			if id == 0 {
+				continue
+			}
+			title := strOf(m, "title", "titleDetail")
+			// 这三类上游只给排行元信息、不给可播放条目：专辑榜/音乐人榜/MV 榜的
+			// songInfoList 为空。首页卡片点进去只会得到空列表，分类层直接隐藏。
+			if hiddenToplist(title) {
+				continue
+			}
+			history := topHistory(m)
+			period := strOf(m, "period")
+			historySupported := period != "" || len(asArr(history["year"])) > 0 || len(asArr(history["sub_period"])) > 0
+			toplists = append(toplists, obj{
+				"id":                id,
+				"title":             title,
+				"picurl":            topPic(m),
+				"desc":              strOf(m, "intro", "desc"),
+				"songnum":           numOf(m, "totalNum"),
+				"listennum":         numOf(m, "listenNum"),
+				"period":            period,
+				"update_type":       numOf(m, "updateType"),
+				"update_time":       strOf(m, "updateTime"),
+				"update_tips":       strOf(m, "updateTips"),
+				"title_detail":      strOf(m, "titleDetail"),
+				"title_share":       strOf(m, "titleShare"),
+				"history":           history,
+				"history_supported": historySupported,
+			})
+		}
+		if len(toplists) == 0 {
+			continue
+		}
+		groups = append(groups, obj{
+			"id":       numOf(g, "groupId"),
+			"name":     strOf(g, "groupName"),
+			"toplists": toplists,
+		})
+	}
+	return obj{"groups": groups}
+}
+
+func hiddenToplist(title string) bool {
+	return strings.Contains(title, "专辑") || strings.Contains(title, "音乐人") ||
+		strings.Contains(title, "MV") || strings.Contains(title, "有声") ||
+		strings.Contains(strings.ToLower(title), "global-k")
+}
+
+func topPic(m obj) string {
+	for _, k := range []string{"mbFrontPicUrl", "frontPicUrl", "headPicUrl", "mbHeadPicUrl", "topAlbumURL", "mbLogoUrl"} {
+		if v := strOf(m, k); v != "" {
+			return v
+		}
+	}
+	for _, sv := range arrOf(m, "song") {
+		if v := strOf(asObj(sv), "cover"); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func topHistory(m obj) obj {
+	h := objOf(m, "history")
+	return obj{
+		"year":       arrOf(h, "year", "years"),
+		"sub_period": arrOf(h, "subPeriod", "sub_period", "weeks"),
+	}
+}
+
+// —— 排行榜详情（musicToplist.ToplistInfoServer GetDetail）——
+// 上游把榜单元信息放在 data，歌曲放在 songInfoList；归一成与歌单详情近似的
+// {info, songs, total, hasmore}，让榜单页能复用歌单信息头与歌曲行渲染。
+func normalizeTopDetail(raw json.RawMessage) obj {
+	d := decodeObj(raw)
+	data := objOf(d, "data")
+	if len(data) == 0 {
+		data = d
+	}
+	songs := arrOf(d, "songInfoList")
+	if len(songs) == 0 {
+		songs = arrOf(data, "songInfoList")
+	}
+	pic := topPic(data)
+	if pic == "" && len(songs) > 0 {
+		album := objOf(asObj(songs[0]), "album")
+		if pmid := strOf(album, "pmid", "mid"); pmid != "" {
+			pic = "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + strings.SplitN(pmid, "_", 2)[0] + ".jpg"
+		}
+	}
+	total := numOf(data, "totalNum", "total")
+	if total == 0 {
+		total = int64(len(songs))
+	}
+	info := obj{
+		"id":           numOf(data, "topId", "topid", "id"),
+		"title":        strOf(data, "title"),
+		"picurl":       pic,
+		"desc":         strOf(data, "intro", "desc"),
+		"songnum":      total,
+		"listennum":    numOf(data, "listenNum"),
+		"period":       strOf(data, "period"),
+		"update_type":  numOf(data, "updateType"),
+		"update_time":  strOf(data, "updateTime"),
+		"update_tips":  strOf(data, "updateTips"),
+		"title_detail": strOf(data, "titleDetail"),
+		"title_share":  strOf(data, "titleShare"),
+		"history":      topHistory(data),
+	}
+	return obj{
+		"info":    info,
+		"songs":   songs,
+		"total":   total,
+		"hasmore": int64(len(songs)) < total,
+	}
+}
+
+// —— AI 歌单（AiPlCategory get_ai_category_content：v_item[].basic）——
+// 网页版 source=1 的分类把普通歌单分类覆写成 AiPlCategory；返回结构与
+// PlaylistSquare 不同，不能复用 normalizeRecommendSonglists 的 List[*].Playlist 路径。
+func normalizeAISonglists(raw json.RawMessage, page, num int) obj {
+	d := decodeObj(raw)
+	if data := objOf(d, "data"); len(data) > 0 {
+		d = data
+	}
+	content := objOf(d, "content")
+	items := arrOf(content, "v_item", "items")
+	out := arr{}
+	for _, it := range items {
+		wrapper := asObj(it)
+		basic := objOf(wrapper, "basic")
+		if len(basic) == 0 {
+			basic = wrapper // 容错：上游偶尔直接下发 basic 字段
+		}
+		item := songlistItem(basic)
+		if item["picurl"] == "" {
+			item["picurl"] = strOf(objOf(basic, "cover"), "default_url", "medium_url", "big_url")
+		}
+		item["creator_nick"] = strOf(objOf(basic, "creator"), "nick", "name")
+		if item["id"] != int64(0) {
+			out = append(out, item)
+		}
+	}
+	total := numOf(content, "total_cnt", "total")
+	if total == 0 && len(out) > 0 {
+		total = int64(page * num)
+	}
+	return obj{
+		"songlists": out,
+		"total":     total,
+		"hasmore":   int64(page*num) < total,
+	}
+}
+
 // —— 推荐新歌（RecommendNewSongResponse：songs←songlist）——
 func normalizeNewsong(raw json.RawMessage) obj {
 	d := decodeObj(raw)

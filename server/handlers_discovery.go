@@ -163,6 +163,27 @@ func (a *App) handleRecommendSonglist(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, normalizeRecommendSonglists(raw))
 }
 
+func (a *App) handleRecommendAISonglist(w http.ResponseWriter, r *http.Request) {
+	page := queryInt(r, "page", 1)
+	num := queryInt(r, "num", 8)
+	if page < 1 {
+		page = 1
+	}
+	if num < 1 {
+		num = 8
+	} else if num > 30 {
+		num = 30
+	}
+	raw, err := a.call(false, func() (json.RawMessage, error) {
+		return a.recom.GetAISonglist(page, num)
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeOK(w, normalizeAISonglists(raw, page, num))
+}
+
 func (a *App) handleRecommendNewsong(w http.ResponseWriter, r *http.Request) {
 	typ := queryInt(r, "type", 5)
 	raw, err := a.call(false, func() (json.RawMessage, error) {
@@ -201,22 +222,23 @@ func (a *App) handleTopCategory(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeTopCategories(raw))
 }
 
 func (a *App) handleTopDetail(w http.ResponseWriter, r *http.Request) {
 	var topID int64
 	fmt.Sscanf(r.PathValue("top_id"), "%d", &topID)
 	page := queryInt(r, "page", 1)
-	num := queryInt(r, "num", 50)
+	num := queryInt(r, "num", 100)
+	period := r.URL.Query().Get("period")
 	raw, err := a.call(false, func() (json.RawMessage, error) {
-		return a.top.GetDetail(topID, int64(page), int64(num))
+		return a.top.GetDetail(topID, int64(page), int64(num), period)
 	})
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeOK(w, json.RawMessage(raw))
+	writeOK(w, normalizeTopDetail(raw))
 }
 
 // ===================== 专辑 / 歌手 =====================
