@@ -63,7 +63,7 @@ QUAVER_PORT=3200 ./typhoeus-go        # 默认 http://127.0.0.1:3200
 | GET  | `/songlist/fav/check` | 已收藏歌单 ID 集合 |
 | GET  | `/search` `/search/general` `/search/complete` `/search/hotkey` | 搜索域 |
 | GET  | `/recommend/guess` `/recommend/songlist` `/recommend/newsong` `/recommend/daily` | 推荐域 |
-| GET  | `/top/category` `/top/{id}/detail` | 榜单 |
+| GET  | `/top/category` `/top/{id}/detail?period=` | 榜单（period 可回查历史周/日/实时期次） |
 | GET  | `/album/{id\|mid}/detail` `/album/{v}/songs` | 专辑 |
 | GET  | `/singer/{mid}/info` `/songs?order=` `/albums` `/similar` `/desc` | 歌手 |
 

@@ -138,6 +138,106 @@ func TestNormalizeSingerAlbums(t *testing.T) {
 	}
 }
 
+// TestNormalizeAISonglists 网页版 AI 歌单分类（t1=9527）返回 v_item[].basic，
+// 与普通推荐歌单的 List[].Playlist.basic 不同；字段必须归一成首页卡片契约，
+// 否则封面、播放量、作者和分页状态都会静默为空。
+func TestNormalizeAISonglists(t *testing.T) {
+	raw := json.RawMessage(`{
+		"code": 0,
+		"data": {"content": {"total_cnt": 151, "v_item": [
+			{"basic": {"tid": 211111, "dirid": 211111, "title": "百万收藏", "song_cnt": 50,
+				"play_cnt": 3075617188, "cover": {"default_url": "https://img.example/cover.jpg"},
+				"creator": {"uin": "2783429033", "nick": "QQ音乐官方歌单"}}},
+			{"basic": {"tid": 0, "title": "无效卡片"}}
+		]}}
+	}`)
+	out := normalizeAISonglists(raw, 1, 8)
+	list, ok := out["songlists"].(arr)
+	if !ok || len(list) != 1 {
+		t.Fatalf("songlists 应过滤无效 id 并保留 1 项: %v", out["songlists"])
+	}
+	item := asObj(list[0])
+	if item["id"] != int64(211111) || item["title"] != "百万收藏" {
+		t.Fatalf("歌单标识/标题未归一化: %v", item)
+	}
+	if item["picurl"] != "https://img.example/cover.jpg" || item["listennum"] != int64(3075617188) {
+		t.Fatalf("封面/播放量未归一化: %v", item)
+	}
+	if item["creator_nick"] != "QQ音乐官方歌单" {
+		t.Fatalf("作者未归一化: %v", item)
+	}
+	if out["total"] != int64(151) || out["hasmore"] != true {
+		t.Fatalf("分页状态错误: total=%v hasmore=%v", out["total"], out["hasmore"])
+	}
+}
+
+// TestNormalizeTopCategories 网页版榜单入口（ryqq_v2/toplist）的卡片字段：
+// 榜单 id/标题/封面/期次与 history 必须一起交给前端，否则首页卡片点不进历史期。
+func TestNormalizeTopCategories(t *testing.T) {
+	raw := json.RawMessage(`{"group":[{"groupId":0,"groupName":"巅峰榜","toplist":[
+		{"topId":26,"title":"热歌榜","period":"2026-10-19","updateType":1,"updateTips":"每日更新",
+		 "listenNum":19300000,"totalNum":300,"frontPicUrl":"http://img.example/top.jpg",
+		 "intro":"站内热度","history":{"year":[2026],"subPeriod":[[37,36]]},"song":[{"cover":"https://img.example/song.jpg"}]},
+		{"topId":23,"title":"畅销专辑"},{"topId":201,"title":"MV榜"},{"topId":502,"title":"腾讯音乐人新势力榜"},
+		{"topId":75,"title":"有声榜"},{"topId":506,"title":"Global-K Chart"},
+		{"topId":0,"title":"无效榜"}
+	]}]}`)
+	out := normalizeTopCategories(raw)
+	groups := out["groups"].(arr)
+	if len(groups) != 1 {
+		t.Fatalf("groups 应有 1 项: %v", out["groups"])
+	}
+	g := asObj(groups[0])
+	list := g["toplists"].(arr)
+	if len(list) != 1 {
+		t.Fatalf("无效/空数据榜单应被过滤: %v", list)
+	}
+	item := asObj(list[0])
+	if item["id"] != int64(26) || item["title"] != "热歌榜" || item["period"] != "2026-10-19" {
+		t.Fatalf("榜单标识/期次未归一化: %v", item)
+	}
+	if item["picurl"] != "http://img.example/top.jpg" || item["songnum"] != int64(300) || item["update_type"] != int64(1) {
+		t.Fatalf("卡片字段未归一化: %v", item)
+	}
+	history := asObj(item["history"])
+	if weeks := history["sub_period"].(arr); len(weeks) != 1 || len(weeks[0].(arr)) != 2 {
+		t.Fatalf("history 必须归一成 sub_period: %v", history)
+	}
+	if item["history_supported"] != true {
+		t.Fatalf("有 period/history 的榜单应标记可回溯: %v", item)
+	}
+}
+
+// TestNormalizeTopDetail 榜单详情归一成歌单页同形：info 供信息头，songs 供行渲染。
+func TestNormalizeTopDetail(t *testing.T) {
+	raw := json.RawMessage(`{
+		"data":{"topId":78,"title":"国乐榜","period":"2026_36","updateType":0,"updateTips":"每周更新",
+			"intro":"每周国乐","listenNum":123,"totalNum":2,
+			"history":{"year":[2026],"subPeriod":[[37,36]]},
+			"headPicUrl":"http://img.example/head.png"},
+		"songInfoList":[{"mid":"m1","name":"第一首"},{"mid":"m2","name":"第二首"}]
+	}`)
+	out := normalizeTopDetail(raw)
+	info := asObj(out["info"])
+	if info["id"] != int64(78) || info["title"] != "国乐榜" || info["period"] != "2026_36" {
+		t.Fatalf("info 标识/期次未归一化: %v", info)
+	}
+	if info["picurl"] != "http://img.example/head.png" || info["songnum"] != int64(2) {
+		t.Fatalf("info 封面/数量未归一化: %v", info)
+	}
+	history := asObj(info["history"])
+	weeks := history["sub_period"].(arr)
+	if len(weeks) != 1 || len(weeks[0].(arr)) != 2 {
+		t.Fatalf("周榜期次必须归一成 sub_period: %v", history)
+	}
+	if songs := out["songs"].(arr); len(songs) != 2 || strOf(asObj(songs[0]), "mid") != "m1" {
+		t.Fatalf("songs 顺序或数量错误: %v", out["songs"])
+	}
+	if out["total"] != int64(2) || out["hasmore"] != false {
+		t.Fatalf("分页状态错误: %v", out)
+	}
+}
+
 // TestNormalizeAlbumSongsUsesAlbumOrder 专辑曲序由上游 songInfo.index_album 给出；
 // 归一化只能解包 songInfo，不能按歌曲字段重新排序。
 func TestNormalizeAlbumSongsUsesAlbumOrder(t *testing.T) {
