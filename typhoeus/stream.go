@@ -188,6 +188,15 @@ func CopyRange(ctx context.Context, w io.Writer, url string, first *UpstreamResp
 	pos := start
 	resp := first
 	left := resume
+	// 所有权纪律：first 归调用方（handler 的 defer 负责），CopyRange 自己重开的每一段
+	// 必须自己关干净。原先只在「下一轮开头」关上一轮，于是续传成功后收尾那一段
+	// 永久没人关 —— 每续传一次泄一条 CDN 连接（读尽/截断都不会替你 Close）。
+	var owned io.ReadCloser
+	defer func() {
+		if owned != nil {
+			_ = owned.Close()
+		}
+	}()
 	for {
 		n, err := pump(ctx, w, resp.Body, pos, cipher)
 		pos += n
@@ -202,17 +211,26 @@ func CopyRange(ctx context.Context, w io.Writer, url string, first *UpstreamResp
 		if totalKnown && end >= 0 && pos > end {
 			return pos - start, nil
 		}
+		// 客户端已离开（seek/切歌/暂停/预加载被丢弃）：续传等于往一个已经不存在的
+		// 响应里写字节——白等 250ms 退避，且回源用的还是被取消的 ctx，必然失败。
+		// 直接收手，把「良性 or 真故障」的判断交给调用方（见 IsClientAbort）。
+		if IsClientAbort(err) || ctx.Err() != nil {
+			return pos - start, err
+		}
 		if left <= 0 {
 			return pos - start, err
 		}
 		left--
 		time.Sleep(resumeBackoff)
-		resp.Body.Close()
+		if owned != nil {
+			_ = owned.Close() // 上一段先还连接，不等函数退出
+			owned = nil
+		}
 		next, rerr := reopenAt(ctx, url, pos)
 		if rerr != nil {
 			return pos - start, err // 续传失败，报原始错误
 		}
-		resp = next
+		resp, owned = next, next.Body
 	}
 }
 
@@ -242,7 +260,8 @@ func pump(ctx context.Context, w io.Writer, body io.Reader, startPos int64, ciph
 				chunk = cipher.Decrypt(chunk, pos)
 			}
 			if _, werr := w.Write(chunk); werr != nil {
-				return pos - startPos, werr // 客户端断开：直接返回
+				// 写端失败 = 客户端（经主进程中继）已经不在了；打标让续传跳过这轮。
+				return pos - startPos, wrapClientGone(werr)
 			}
 			pos += int64(n)
 		}

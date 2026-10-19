@@ -247,11 +247,21 @@ func (a *App) handleStreamProxy(w http.ResponseWriter, r *http.Request) {
 	// 断流续传：CDN 掐连接/读超时把「播放中断」降级为「一次短暂停顿」。
 	written, err := typhoeus.CopyRange(r.Context(), discardLogger{w}, entry.url, up,
 		entry.cipher, start, end, entry.total > 0, resume)
-	if err != nil {
-		// 区分良性断开与真故障：播放器切歌/预加载 abort 同样表现为写端 reset；
-		// 早期断开（几乎没发数据）多为良性，大量传输后断开才值得追查。
-		logWarn("回源流提前结束（已发 %d 字节，起点 %d）: %v", written, start, err)
+	if err == nil {
+		return
 	}
+	if typhoeus.IsClientAbort(err) {
+		// 播放器 seek / 切歌 / 暂停 / 预加载被丢弃：Chromium 关掉请求后，主进程的中继
+		// 立刻 abort 它对 sidecar 的 fetch（native-server.ts: onClientGone）——于是这里
+		// 看到 context canceled 或写端 connection reset by peer。
+		//
+		// 完全良性：已送出的字节没问题，播放器会带着新偏移重开一个 Range；预加载读掉
+		// 十几 MB 再丢弃是 Chromium 媒体栈的常规行为。真能看到问题的是下面那条 WARN。
+		logDebug("播放流由客户端结束（已发 %d 字节，起点 %d）: %v", written, start, err)
+		return
+	}
+	// 到这里才是真故障：上游 reset / 提前 EOF / 续传失败（重连后仍没补完）。
+	logWarn("回源流提前结束（已发 %d 字节，起点 %d）: %v", written, start, err)
 }
 
 // discardLogger 包装 writer（占位，保持 io.Writer 语义）。
