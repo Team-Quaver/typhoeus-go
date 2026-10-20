@@ -1,10 +1,17 @@
 //go:build linux
 
-// Linux —— xdg-desktop-portal「Inhibit」优先，未生效则 Logind 直连兜底。
+// Linux —— 睡眠走 Logind 直连，空闲走 xdg-desktop-portal 优先；失败时互相兜底。
 //
 // ModeSleep 只阻止系统睡眠；ModeIdle 阻止桌面进入空闲，从而保持画廊屏幕亮起。
 //
-// ① 门户路径（org.freedesktop.portal.Inhibit，规范 v3）：
+// ① Logind / elogind 直连（org.freedesktop.login1.Manager）—— ModeSleep 首选：
+//
+//	Inhibit("sleep"/"idle", "Quaver", why, "block") → h fd
+//
+// fd 开着即持有，Close 即释放，进程退出自动回收；polkit 对活跃会话默认放行
+// （inhibit-block-sleep allow_active=yes）。会话总线都不可用的环境也能走（system 总线独立）。
+//
+// ② 门户路径（org.freedesktop.portal.Inhibit，规范 v3）—— ModeIdle 首选：
 //
 //	Inhibit(IN window s, IN flags u, IN options a{sv}, OUT handle o)
 //	flags：0x1=Logout 0x2=UserSwitch 0x4=Suspend 0x8=Idle —— 按 Mode 置位
@@ -13,17 +20,11 @@
 // 收到 code!=0 视为拒绝。持有 = Request 句柄存活；释放 = Request.Close()；
 // 会话结束/总线断开时门户自动释放。桌面实现把请求转交会话管理器/电源守护。
 //
-// Response=0 即视为门户成功。不要要求 logind ListInhibitors 出现对应行：门户
-// 可能将请求转给桌面会话电源服务，不会在 logind 暴露同一条 inhibitor。
-// D-Bus 连接/方法调用/Response 无响应或明确拒绝时，再通过 system bus 尝试
-// org.freedesktop.login1.Manager（systemd-logind 或 elogind）。
-//
-// ② Logind / elogind 直连（org.freedesktop.login1.Manager）：
-//
-//	Inhibit("sleep"/"idle", "Quaver", why, "block") → h fd
-//
-// fd 开着即持有，Close 即释放，进程退出自动回收；polkit 对活跃会话默认放行
-// （inhibit-block-sleep allow_active=yes）。会话总线都不可用的环境也能走（system 总线独立）。
+// 注意：Hyprland 下门户可能应答 code=0，却没有任何后端真正登记抑制（实测
+// xdg-desktop-portal-gtk 会假成功）。因此 ModeSleep 不能把门户的 Response=0
+// 当作可靠结果，必须优先走 Logind 直连；门户只在 Logind 不可用时兜底。
+// ModeIdle 仍以门户优先，因为桌面空闲通常由会话/合成器管理，Logind 的 idle
+// inhibitor 不一定能阻止合成器自己的 idle 定时器。
 //
 // 两条路径持有期都以本 sidecar 进程存亡为准，UI 崩掉不会留下「永不睡」的系统。
 package inhibit
@@ -76,13 +77,30 @@ func (b *linuxBackend) acquire() error {
 	if b.request != "" || b.inhibitFD >= 0 {
 		return nil // 已持有
 	}
-	if reason := b.tryPortal(); reason != "" {
-		Logf("WARN", "%s禁止：%s，改走 Logind 直连", b.mode.label(), reason)
-		if err := b.acquireLogin1(); err != nil {
-			return fmt.Errorf("%s禁止：%s；Logind 直连也失败: %w", b.mode.label(), reason, err)
+	if b.preferPortal() {
+		if reason := b.tryPortal(); reason != "" {
+			Logf("WARN", "%s禁止：%s，改走 Logind 直连", b.mode.label(), reason)
+			if err := b.acquireLogin1(); err != nil {
+				return fmt.Errorf("%s禁止：%s；Logind 直连也失败: %w", b.mode.label(), reason, err)
+			}
+		}
+		return nil
+	}
+
+	// ModeSleep：Hyprland 的门户可能假成功，直接 Logind 才是可靠依据。
+	if err := b.acquireLogin1(); err != nil {
+		Logf("WARN", "%s禁止：Logind 直连不可用（%v），改走 XDG 门户", b.mode.label(), err)
+		if reason := b.tryPortal(); reason != "" {
+			return fmt.Errorf("%s禁止：Logind 直连失败（%w）；门户也失败：%s", b.mode.label(), err, reason)
 		}
 	}
 	return nil
+}
+
+// preferPortal 选择获得抑制的首选通道。睡眠由 logind 最终执行，直连最可靠；
+// 空闲更多取决于会话/合成器，因此门户优先。
+func (b *linuxBackend) preferPortal() bool {
+	return b.mode == ModeIdle
 }
 
 // tryPortal 走一遍门户持有流程。空串 = 成功持有；否则返回未生效原因（门户侧已清理干净）。
