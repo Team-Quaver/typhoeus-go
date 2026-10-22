@@ -45,6 +45,11 @@ type App struct {
 	// 中继 token 表（进程内，不落盘；重启丢链接可接受——UI 重新 resolve 即可）
 	streamMu sync.Mutex
 	streams  map[string]*streamEntry
+
+	// mid 粒度限速桶（版权保护；语义见 stream_guard.go）。桶只存计数不存内容，
+	// 随 purgeExpired 的空闲清扫回收。
+	paceMu  sync.Mutex
+	paceMap map[string]*byteBucket
 }
 
 // NewApp 组装应用。
@@ -86,6 +91,7 @@ func NewApp() (*App, error) {
 		inhibitIdle:  inhibit.NewWithMode(inhibit.ModeIdle),
 		mobileStates: map[string]*mobileQRState{},
 		streams:      map[string]*streamEntry{},
+		paceMap:      map[string]*byteBucket{},
 	}
 	return app, nil
 }

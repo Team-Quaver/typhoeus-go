@@ -225,6 +225,11 @@ func ekeyForClient(ekey string, result int64) string {
 }
 
 func (a *App) handleSongUrls(w http.ResponseWriter, r *http.Request) {
+	// 裸链（含 vkey/ekey）只交给原生客户端：页面直连一律 403（版权闸门，见 stream_guard.go；
+	// Electron 主进程的 webRequest 层同时把这两条路径对整个渲染层拉了黑）
+	if denyBrowserClients(w, r) {
+		return
+	}
 	var body songUrlsBody
 	if !decodeBody(w, r, &body) {
 		return
@@ -282,6 +287,9 @@ func (a *App) handleSongDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleSongURL(w http.ResponseWriter, r *http.Request) {
+	if denyBrowserClients(w, r) { // 同上：裸链不服务页面直连（stream_guard.go）
+		return
+	}
 	value := r.PathValue("value")
 	ftCode := queryInt(r, "file_type", 13)
 	ft, err := songFileTypeOf(&ftCode)

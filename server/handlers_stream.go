@@ -20,22 +20,28 @@ import (
 
 // streamEntry 一条已协商的播放流。
 type streamEntry struct {
-	mid       string
-	url       string
-	mime      string
-	total     int64
-	filename  string
-	tier      string
-	vkey      string
-	encrypted bool
-	cipher    qmc.Cipher // 仅加密流非 nil；按绝对偏移解密，无跨请求状态
-	expiresAt time.Time
-	hits      int
-	degraded  bool
-	requested string
+	mid        string
+	url        string
+	mime       string
+	total      int64
+	filename   string
+	tier       string
+	vkey       string
+	encrypted  bool
+	cipher     qmc.Cipher // 仅加密流非 nil；按绝对偏移解密，无跨请求状态
+	expiresAt  time.Time
+	createdAt  time.Time // 绝对上限锚点（滑动续期不能无限续命）
+	hits       int
+	degraded   bool
+	requested  string
+	durationMs int64 // 客户端声明的曲长（限速推算用；0=未知）
+	probeBytes int64 // fetch 探测类请求已发放的额度（分类见 stream_guard.go）
 }
 
-const streamTTL = 2 * time.Hour // 与上游 vkey expiration 同量级；播放中命中即续期（滑动过期）
+const (
+	streamIdleTTL = 30 * time.Minute // 滑动空闲过期：离开播放即回收（旧值 2h 让复制走的 URL 长期有效）
+	streamMaxAge  = 3 * time.Hour    // 绝对上限：滑动续期不能无限续命（vkey 自身也有过期）
+)
 
 // purgeExpired 清理过期 token。
 func (a *App) purgeExpired() {
@@ -43,11 +49,12 @@ func (a *App) purgeExpired() {
 	a.streamMu.Lock()
 	defer a.streamMu.Unlock()
 	for tok, e := range a.streams {
-		if e.expiresAt.Before(now) {
+		if e.expiresAt.Before(now) || now.Sub(e.createdAt) > streamMaxAge {
 			// 解密器随条目一起释放；它本身不含可落盘状态
 			delete(a.streams, tok)
 		}
 	}
+	a.dropIdlePace(now)
 }
 
 // newToken 生成 url-safe 随机 token。
@@ -118,6 +125,7 @@ type streamResolveBody struct {
 	Auto         bool     `json:"auto"`         // true=自动音质模式（会员不足向下降档，不报 403）
 	Deprioritize []string `json:"deprioritize"` // 回退链降权档位（UI「回退排序」开关）
 	Platform     string   `json:"platform"`     // 取链平台身份：android(缺省)/web/desktop——严格曲库的版权判定与此相关
+	DurationMs   int64    `json:"duration_ms"`  // 曲长提示（秒×1000）：中继限速的实时倍率据此推算；缺省按整曲 ≥2 分钟兜底
 }
 
 func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
@@ -148,22 +156,27 @@ func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
 	}
 	a.purgeExpired()
 	token := newToken()
+	now := time.Now()
 	a.streamMu.Lock()
 	a.streams[token] = &streamEntry{
-		mid:       resolved.Mid,
-		url:       resolved.URL,
-		mime:      resolved.Tier.Mime,
-		total:     total,
-		filename:  resolved.Filename,
-		tier:      resolved.Tier.ID,
-		vkey:      resolved.VKey,
-		encrypted: resolved.Encrypted,
-		cipher:    resolved.Cipher,
-		expiresAt: time.Now().Add(streamTTL),
-		degraded:  resolved.Degraded,
-		requested: resolved.RequestedTier.ID,
+		mid:        resolved.Mid,
+		url:        resolved.URL,
+		mime:       resolved.Tier.Mime,
+		total:      total,
+		filename:   resolved.Filename,
+		tier:       resolved.Tier.ID,
+		vkey:       resolved.VKey,
+		encrypted:  resolved.Encrypted,
+		cipher:     resolved.Cipher,
+		expiresAt:  now.Add(streamIdleTTL),
+		createdAt:  now,
+		degraded:   resolved.Degraded,
+		requested:  resolved.RequestedTier.ID,
+		durationMs: body.DurationMs,
 	}
 	a.streamMu.Unlock()
+	// mid 粒度限速桶：resolve 即建档（换档刷新倍率），跨 token 共享，重取链接刷不出额度
+	a.paceBucket(resolved.Mid, paceRateFor(total, body.DurationMs))
 
 	writeOK(w, map[string]any{
 		"token":          token,
@@ -180,15 +193,49 @@ func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleStreamProxy Range 透传中继（<audio> src 指这里；vkey/ekey 留在后端）。
+//
+// 版权闸门（类别判定与额度语义见 stream_guard.go）：
+//   - document/frame 等浏览器导航类 → 403（堵「复制 URL 到新标签页/另存为」）
+//   - empty（渲染层 fetch）→ 只允许小闭合 Range，且每 token 累计 ≤2MiB（音质浮窗探测）
+//   - audio/video 与原生客户端（缺头）→ 放行，但统一过 mid 限速桶
 func (a *App) handleStreamProxy(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
+
+	cls := classifyStreamClient(r)
+	var probeSpan int64
+	switch cls {
+	case classBlocked:
+		writeErr(w, http.StatusForbidden, -1, "播放流仅允许应用内播放器取用")
+		return
+	case classProbe:
+		span, ok := closedRangeSpan(r.Header.Get("Range"))
+		if !ok || span > probeMaxSpan {
+			writeErr(w, http.StatusForbidden, -1, "页面 fetch 仅允许小范围探测（取容器头），不支持整段取流")
+			return
+		}
+		probeSpan = span
+	case classPlayer, classMedia:
+	}
+
 	a.streamMu.Lock()
 	entry, ok := a.streams[token]
-	if ok {
+	probeOver := false
+	if ok && cls == classProbe {
+		if entry.probeBytes+probeSpan > probeMaxBudget {
+			probeOver = true // 探测预算耗尽：同一 token 上「分块搬运整曲」的形态
+		} else {
+			entry.probeBytes += probeSpan
+		}
+	}
+	if ok && !probeOver {
 		entry.hits++
-		entry.expiresAt = time.Now().Add(streamTTL) // 滑动续期：活跃播放不过期
+		entry.expiresAt = time.Now().Add(streamIdleTTL) // 滑动续期：活跃播放不过期
 	}
 	a.streamMu.Unlock()
+	if probeOver {
+		writeErr(w, http.StatusForbidden, -1, "取流探测超出预算，请重新播放")
+		return
+	}
 	if !ok {
 		writeErr(w, http.StatusNotFound, -1, "播放流不存在或已过期，请重新播放")
 		return
@@ -249,7 +296,10 @@ func (a *App) handleStreamProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 断流续传：CDN 掐连接/读超时把「播放中断」降级为「一次短暂停顿」。
-	written, err := typhoeus.CopyRange(r.Context(), discardLogger{w}, entry.url, up,
+	// 限速：写出经 mid 令牌桶（≈3× 实时码率）——「整曲一把抓」被拖成接近实时，
+	// 正常播放与 seek 只吃突发额度，无感。
+	bucket := a.paceBucket(entry.mid, paceRateFor(entry.total, entry.durationMs))
+	written, err := typhoeus.CopyRange(r.Context(), &pacedWriter{w: discardLogger{w}, b: bucket, ctx: r.Context()}, entry.url, up,
 		entry.cipher, start, end, entry.total > 0, resume)
 	if err == nil {
 		return
