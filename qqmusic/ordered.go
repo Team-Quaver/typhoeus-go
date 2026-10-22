@@ -10,6 +10,7 @@
 package qqmusic
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 	"unicode/utf16"
@@ -123,6 +124,8 @@ func writeJSONValue(b *strings.Builder, v any) {
 		b.WriteString(strconv.FormatFloat(x, 'g', -1, 64))
 	case float32:
 		b.WriteString(strconv.FormatFloat(float64(x), 'g', -1, 32))
+	case json.Number:
+		b.WriteString(x.String())
 	case string:
 		writeJSONString(b, x)
 	case *JObj:

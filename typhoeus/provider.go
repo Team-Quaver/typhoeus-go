@@ -28,6 +28,7 @@ type LinkResult struct {
 	Playable   bool
 	URL        string // 绝对 URL（CDN 域名已拼接）
 	Filename   string
+	VKey       string // 播放凭证；仅后端用于音响力流水，不下发前端
 	ResultCode int64
 	Ekey       string // 仅加密链路携带；明文链路恒为空且被显式丢弃
 	Encrypted  bool
@@ -194,6 +195,7 @@ func (p *QQMusicProvider) resolveLinksPlatform(ctx context.Context, mid, mediaMi
 			Playable:   playable,
 			URL:        url,
 			Filename:   it.Filename,
+			VKey:       it.Vkey,
 			ResultCode: it.Result,
 			// 加密链路保留 ekey 供解密器使用；明文链路即便上游误回也显式丢弃
 			Ekey:      pickEkey(enc, it.Ekey),

@@ -21,6 +21,7 @@ type ResolvedStream struct {
 	RequestedTier *Tier // 客户端请求档位
 	URL           string
 	Filename      string
+	VKey          string // 音响力上报凭证（仅后端持有）
 	Encrypted     bool
 	Cipher        qmc.Cipher // 加密流的解密器（仅内存；不序列化、不落盘）
 	Degraded      bool       // 命中档位低于请求档位
@@ -82,7 +83,7 @@ func (r *StreamResolver) Resolve(ctx context.Context, mid, mediaMid, tierID stri
 				if !r.probePlain || r.sniffDirectOK(ctx, hit.URL) {
 					return &ResolvedStream{
 						Mid: mid, Tier: tier, RequestedTier: target,
-						URL: hit.URL, Filename: hit.Filename,
+						URL: hit.URL, Filename: hit.Filename, VKey: hit.VKey,
 						Degraded: tier != target,
 					}, nil
 				}
@@ -115,7 +116,7 @@ func (r *StreamResolver) Resolve(ctx context.Context, mid, mediaMid, tierID stri
 			}
 			return &ResolvedStream{
 				Mid: mid, Tier: tier, RequestedTier: target,
-				URL: hit.URL, Filename: hit.Filename,
+				URL: hit.URL, Filename: hit.Filename, VKey: hit.VKey,
 				Encrypted: true, Cipher: cipher,
 				Degraded: tier != target,
 			}, nil
@@ -200,6 +201,7 @@ func (r *StreamResolver) resolveEncryptedBatch(ctx context.Context, mid, mediaMi
 			Mid: mid, Tier: c.tier, RequestedTier: target,
 			URL:       r.provider.streamURL(ctx, c.entry.Purl),
 			Filename:  c.entry.Filename,
+			VKey:      c.entry.Vkey,
 			Encrypted: true, Cipher: cipher,
 			Degraded: c.tier != target,
 		}, nil

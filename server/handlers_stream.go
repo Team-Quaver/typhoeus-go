@@ -20,11 +20,13 @@ import (
 
 // streamEntry 一条已协商的播放流。
 type streamEntry struct {
+	mid       string
 	url       string
 	mime      string
 	total     int64
 	filename  string
 	tier      string
+	vkey      string
 	encrypted bool
 	cipher    qmc.Cipher // 仅加密流非 nil；按绝对偏移解密，无跨请求状态
 	expiresAt time.Time
@@ -148,11 +150,13 @@ func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
 	token := newToken()
 	a.streamMu.Lock()
 	a.streams[token] = &streamEntry{
+		mid:       resolved.Mid,
 		url:       resolved.URL,
 		mime:      resolved.Tier.Mime,
 		total:     total,
 		filename:  resolved.Filename,
 		tier:      resolved.Tier.ID,
+		vkey:      resolved.VKey,
 		encrypted: resolved.Encrypted,
 		cipher:    resolved.Cipher,
 		expiresAt: time.Now().Add(streamTTL),

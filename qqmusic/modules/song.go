@@ -193,6 +193,36 @@ func (m *SongModule) GetSongURLs(files []SongFileInfo, fileType SongFileType, op
 	return qqmusic.ParseCGIData(data, nil)
 }
 
+// GetPlaybackVKey 取标准音质的 vkey（听歌时长流水需要它作为播放凭证）。
+// 播放主链路仍走 Typhoeus；这里只服务音响力上报，避免把 vkey 暴露给渲染层。
+func (m *SongModule) GetPlaybackVKey(mid, mediaMid string) (string, error) {
+	if mid == "" {
+		return "", qqmusic.NewDataError("缺少歌曲 mid")
+	}
+	raw, err := m.GetSongURLs([]SongFileInfo{{
+		Mid: mid, MediaMid: mediaMid, FileType: &TypeMP3128,
+	}}, TypeMP3128, qqmusic.CGIOption{})
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Items []struct {
+			Vkey   string `json:"vkey"`
+			Result int64  `json:"result"`
+			Purl   string `json:"purl"`
+		} `json:"midurlinfo"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", qqmusic.NewDataError("播放凭证响应解析失败")
+	}
+	for _, item := range resp.Items {
+		if item.Result == 0 && item.Vkey != "" && item.Purl != "" {
+			return item.Vkey, nil
+		}
+	}
+	return "", nil
+}
+
 // EVkeyVariant 一个加密文件变体（文件名前缀 + 扩展名，如 F0M0/.mflac）。
 type EVkeyVariant struct {
 	Pref string

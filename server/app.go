@@ -115,6 +115,7 @@ func (a *App) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /stream/tiers", a.handleStreamTiers)
 	mux.HandleFunc("POST /stream/resolve", a.handleStreamResolve)
 	mux.HandleFunc("GET /stream/{token}", a.handleStreamProxy)
+	mux.HandleFunc("POST /sound-power/report", a.handleSoundPowerReport)
 
 	// 歌曲
 	mux.HandleFunc("POST /song/urls", a.handleSongUrls)

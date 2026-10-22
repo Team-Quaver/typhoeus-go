@@ -26,6 +26,13 @@ const (
 
 var minLevel = parseSeverity(os.Getenv("QUAVER_LOG_LEVEL"))
 
+// crotchetEnabled 与 Electron 的 QUAVER_CROTCHET 判定同口径：非空且不是 0/false。
+// 音响力成功流水属于高频诊断信息，只在 Crotchet 下写完整日志。
+func crotchetEnabled() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("QUAVER_CROTCHET")))
+	return raw != "" && raw != "0" && raw != "false"
+}
+
 func parseSeverity(raw string) severity {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "debug":

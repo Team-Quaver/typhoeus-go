@@ -82,7 +82,11 @@ func (cl *Client) refreshAndroidSession(staleUID string, caller int) (*AndroidSe
 		return nil, err
 	}
 	_ = resp
-	data, err := unwrapCGIResponse(body, 0)
+	item, err := unwrapCGIResponse(body, 0)
+	if err != nil {
+		return nil, err
+	}
+	data, err := ParseCGIData(item, nil)
 	if err != nil {
 		return nil, err
 	}
