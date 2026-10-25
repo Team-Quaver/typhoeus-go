@@ -173,6 +173,109 @@ func TestQQQRUnknownSession(t *testing.T) {
 	}
 }
 
+// 快速登录链路：xlogin 取本地 token → 本机 QQ 换 clientkey → jump 回 check_sig
+// → 复用二维码授权链取 code → QQLogin CGI。clientkey 只允许落在 localhost 与 jump 请求上。
+func TestQQQuickLoginChain(t *testing.T) {
+	redirect := "https://ssl.ptlogin2.graph.qq.com/check_sig?service=jump&ptsigx=QUICK_SIG&uin=123&s_url=https%3A%2F%2Fgraph.qq.com%2Foauth2.0%2Flogin_jump"
+	step := 0
+	transport := loginTransport(func(r *http.Request) (*http.Response, error) {
+		step++
+		switch step {
+		case 1:
+			if r.URL.Host != "xui.ptlogin2.qq.com" {
+				t.Fatal("quick login must bootstrap xlogin")
+			}
+			return reply("", 200, http.Header{"Set-Cookie": {"pt_local_token=LOCAL_TOKEN; Domain=.ptlogin2.qq.com; Path=/"}}), nil
+		case 2:
+			if r.URL.Host != "localhost.ptlogin2.qq.com:4301" || r.URL.Path != "/pt_get_uins" {
+				t.Fatal("must ask local QQ for uins")
+			}
+			requireCookie(t, r, "pt_local_token", "LOCAL_TOKEN")
+			if r.URL.Query().Get("pt_local_tk") != "LOCAL_TOKEN" {
+				t.Fatal("missing pt_local_tk")
+			}
+			return reply(`var var_sso_uin_list=[{"uin":123,"nickname":"quick"}];ptui_getuins_CB(var_sso_uin_list);`, 200, nil), nil
+		case 3:
+			if r.URL.Host != "xui.ptlogin2.qq.com" {
+				t.Fatal("login must refresh pt_local_token")
+			}
+			return reply("", 200, http.Header{"Set-Cookie": {"pt_local_token=LOCAL_TOKEN; Domain=.ptlogin2.qq.com; Path=/"}}), nil
+		case 4:
+			requireCookie(t, r, "pt_local_token", "LOCAL_TOKEN")
+			if r.URL.Query().Get("pt_local_tk") != "LOCAL_TOKEN" {
+				t.Fatal("login must use refreshed token")
+			}
+			if r.URL.Path != "/pt_get_st" || r.URL.Query().Get("clientuin") != "123" {
+				t.Fatal("must exchange clientkey for selected uin")
+			}
+			return reply(`ptui_getst_CB({uin:123,keyindex:19});`, 200, http.Header{"Set-Cookie": {
+				"clientkey=QUICK_KEY; Domain=.ptlogin2.qq.com; Path=/",
+				"clientuin=123; Domain=.ptlogin2.qq.com; Path=/",
+			}}), nil
+		case 5:
+			if r.URL.Host != "ssl.ptlogin2.qq.com" || r.URL.Path != "/jump" {
+				t.Fatal("clientkey must be redeemed at jump")
+			}
+			if strings.Contains(r.Header.Get("Cookie"), "OLD_KEY") || strings.Contains(r.Header.Get("Cookie"), "qm_keyst") {
+				t.Fatal("existing music credentials must not leak to jump")
+			}
+			requireCookie(t, r, "clientkey", "QUICK_KEY")
+			requireCookie(t, r, "clientuin", "123")
+			for _, c := range r.Cookies() {
+				if c.Name == "pt_local_token" {
+					t.Fatal("local SSO cookies must not leak to jump")
+				}
+			}
+			return reply("", 302, http.Header{"Location": {redirect}}), nil
+		case 6:
+			if r.URL.String() != redirect {
+				t.Fatal("jump redirect was reconstructed")
+			}
+			return reply("", 302, http.Header{"Location": {"https://graph.qq.com/oauth2.0/login_jump"}, "Set-Cookie": {
+				"p_skey=QUICK_SKEY; Domain=.graph.qq.com; Path=/",
+			}}), nil
+		case 7:
+			_ = r.ParseForm()
+			if r.Form.Get("from_ptlogin") != "1" {
+				t.Fatal("must authorize from ptlogin session")
+			}
+			return reply("", 302, http.Header{"Location": {"https://y.qq.com/portal/wx_redirect.html?state=state&code=QUICK_CODE"}}), nil
+		case 8:
+			var body struct {
+				Req struct {
+					Param map[string]any `json:"param"`
+				} `json:"req_0"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Req.Param["code"] != "QUICK_CODE" {
+				t.Fatal("bad OAuth code")
+			}
+			return reply(`{"code":0,"req_0":{"code":0,"data":{"musicid":123,"musickey":"QUICK_MUSIC_KEY","loginType":2}}}`, 200, nil), nil
+		default:
+			t.Fatalf("unexpected request %d (%s)", step, r.URL.Path)
+			return nil, nil
+		}
+	})
+	cl, err := qqmusic.NewClient(&qqmusic.Credential{MusicID: 999, MusicKey: "OLD_KEY"}, "", "", qqmusic.WithHTTPClient(&http.Client{Transport: transport}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewLoginModule(cl)
+	account, err := m.DetectQQQuick(context.Background())
+	if err != nil || account == nil || account.UIN != 123 || account.Nickname != "quick" || account.Avatar == "" {
+		t.Fatalf("detect: %+v %v", account, err)
+	}
+	cred, err := m.LoginQQQuick(context.Background(), account.UIN)
+	if err != nil || cred == nil || cred.MusicID != 123 || cred.MusicKey != "QUICK_MUSIC_KEY" {
+		t.Fatalf("login: %+v %v", cred, err)
+	}
+	if step != 8 {
+		t.Fatalf("unexpected request count=%d", step)
+	}
+}
+
 func TestQQOAuthRedirectAndCookies(t *testing.T) {
 	for _, foreign := range []bool{false, true} {
 		t.Run(map[bool]string{false: "intermediate cookies", true: "foreign redirect"}[foreign], func(t *testing.T) {

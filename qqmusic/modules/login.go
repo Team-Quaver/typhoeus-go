@@ -134,6 +134,178 @@ func (m *LoginModule) loginCgi(module, method string, param *qqmusic.JObj, comm 
 
 const qqLoginJump = "https://graph.qq.com/oauth2.0/login_jump"
 
+// ===================== QQ 快速登录 =====================
+
+const qqLocalSSO = "https://localhost.ptlogin2.qq.com:4301"
+
+// QQQuickAccount 本机 QQ 客户端的在线账号（clientkey 绝不出模块边界）。
+type QQQuickAccount struct {
+	UIN      int64  `json:"uin"`
+	Nickname string `json:"nickname"`
+	Avatar   string `json:"avatar"`
+}
+
+// qqQuickSession 一次「检测 → 一键登录」的本地 SSO 会话。
+type qqQuickSession struct {
+	jar     http.CookieJar
+	referer string
+	token   string
+}
+
+var qqQuickUinsRe = regexp.MustCompile(`var_sso_uin_list=(\[.*?\])`)
+
+// DetectQQQuick 在本机 QQ 客户端的 SSO 端口上取已登录账号。
+// 不可用时返回 nil（QQ 未启动/端口不在线/域名未解析都视为没有快速登录）。
+func (m *LoginModule) DetectQQQuick(ctx context.Context) (*QQQuickAccount, error) {
+	params := qqmusic.P("appid", "716027609", "daid", "383", "style", "40", "target", "self",
+		"s_url", qqLoginJump, "pt_3rd_aid", "100497308")
+	jar, _ := cookiejar.New(nil)
+	session := &qqQuickSession{
+		jar:     jar,
+		referer: "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?" + params.Encode(),
+	}
+	resp, err := m.qqQuickRequest(ctx, session, "GET", session.referer, qqmusic.HTTPOption{})
+	if err != nil {
+		return nil, qqmusic.NewDataError("QQ 快速登录不可用：本机未检测到 QQ 客户端")
+	}
+	token := resp.Cookies["pt_local_token"]
+	if token == "" {
+		return nil, qqmusic.NewDataError("QQ 快速登录初始化失败：缺少本地令牌")
+	}
+	session.token = token
+
+	resp, err = m.qqQuickRequest(ctx, session, "GET", qqLocalSSO+"/pt_get_uins", qqmusic.HTTPOption{
+		Params: qqmusic.P("callback", "ptui_getuins_CB",
+			"r", fmt.Sprintf("0.%d", time.Now().UnixNano()%1e10), "pt_local_tk", token),
+		Headers:        map[string]string{"Referer": session.referer},
+		TimeoutSeconds: 3,
+	})
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return nil, qqmusic.NewDataError("QQ 快速登录不可用：本机未检测到 QQ 客户端")
+	}
+	match := qqQuickUinsRe.FindStringSubmatch(resp.Text)
+	if match == nil {
+		return nil, qqmusic.NewDataError("QQ 快速登录响应异常：无法解析本机账号")
+	}
+	var accounts []QQQuickAccount
+	if err := json.Unmarshal([]byte(match[1]), &accounts); err != nil || len(accounts) == 0 {
+		return nil, qqmusic.NewDataError("QQ 快速登录不可用：QQ 客户端中没有已登录账号")
+	}
+	account := accounts[0]
+	account.Avatar = fmt.Sprintf("https://q1.qlogo.cn/g?b=qq&nk=%d&s=100", account.UIN)
+	if account.Nickname == "" {
+		account.Nickname = fmt.Sprintf("QQ %d", account.UIN)
+	}
+	return &account, nil
+}
+
+// LoginQQQuick 用本机 QQ 的 clientkey 兑换 QQ 音乐凭证（全程不打开登录页）。
+func (m *LoginModule) LoginQQQuick(ctx context.Context, uin int64) (*qqmusic.Credential, error) {
+	// 先重新检测一次：pt_local_token/clientkey 都是一次性短寿命凭据，
+	// 不能把 Detect 阶段的密钥缓存在服务端等用户点击。
+	params := qqmusic.P("appid", "716027609", "daid", "383", "style", "40", "target", "self",
+		"s_url", qqLoginJump, "pt_3rd_aid", "100497308")
+	jar, _ := cookiejar.New(nil)
+	quick := &qqQuickSession{
+		jar:     jar,
+		referer: "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?" + params.Encode(),
+	}
+	resp, err := m.qqQuickRequest(ctx, quick, "GET", quick.referer, qqmusic.HTTPOption{})
+	if err != nil {
+		return nil, err
+	}
+	token := resp.Cookies["pt_local_token"]
+	if token == "" {
+		return nil, qqmusic.NewDataError("QQ 快速登录初始化失败：缺少本地令牌")
+	}
+	quick.token = token
+
+	resp, err = m.qqQuickRequest(ctx, quick, "GET", qqLocalSSO+"/pt_get_st", qqmusic.HTTPOption{
+		Params: qqmusic.P("clientuin", strconv.FormatInt(uin, 10), "callback", "ptui_getst_CB",
+			"r", fmt.Sprintf("0.%d", time.Now().UnixNano()%1e10), "pt_local_tk", token),
+		Headers:        map[string]string{"Referer": quick.referer},
+		TimeoutSeconds: 3,
+	})
+	if err != nil {
+		return nil, qqmusic.NewDataError("QQ 快速登录请求失败，请确认 QQ 客户端已启动")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, qqmusic.NewDataError(fmt.Sprintf("QQ 快速登录被拒绝（HTTP %d）", resp.StatusCode))
+	}
+	clientKey := resp.Cookies["clientkey"]
+	if clientKey == "" {
+		return nil, qqmusic.NewDataError("QQ 快速登录被拒绝：未获得 clientkey")
+	}
+
+	// jump 会把 clientkey 兑换成 check_sig 一次性签名；之后与二维码登录同一条授权链。
+	// ptlogin2 对 jump 的 Cookie 非常挑剔：带上 pt_local_token 等本地 Cookie 会被
+	// 判成「已有会话」直接跳 s_url，拿不到 check_sig 一次性签名。
+	// QQNT 的快速登录就是把 clientkey 放在 jump 的 query 里（Cookie 只作会话标识）。
+	jumpURL := "https://ssl.ptlogin2.qq.com/jump?ptlang=2052&clientuin=" + url.QueryEscape(strconv.FormatInt(uin, 10)) +
+		"&clientkey=" + url.QueryEscape(clientKey) +
+		"&u1=" + url.QueryEscape(qqLoginJump) + "&keyindex=19&daid=383&appid=716027609&pt_3rd_aid=100497308"
+	jump, err := m.cl.DoHTTPPlainContext(ctx, "GET", jumpURL, qqmusic.HTTPOption{
+		// jump 只认 clientuin/clientkey；带上 pt_local_token 等本地 Cookie 会被
+		// 判成「已有会话」直接跳 s_url，拿不到 check_sig 一次性签名。
+		Cookies: map[string]string{
+			"clientuin": strconv.FormatInt(uin, 10),
+			"clientkey": clientKey,
+		},
+		Credential: &qqmusic.Credential{}, // 绝不带既有 musickey Cookie
+		Headers:    map[string]string{"Referer": quick.referer},
+		NoRedirect: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	redirect := jump.Headers.Get("Location")
+	if jump.StatusCode == http.StatusOK && redirect == "" {
+		// 老版本客户端会直接在正文里返回 ptuiCB(...)；仍尝试提取 check_sig。
+		if fields := qqArgsRe.FindAllStringSubmatch(jump.Text, -1); len(fields) > 2 {
+			redirect = html.UnescapeString(strings.NewReplacer(`\x26`, "&", `\u0026`, "&", `\/`, "/").Replace(fields[2][1]))
+		}
+	}
+	check, parseErr := url.Parse(redirect)
+	if parseErr != nil || !qqLoginURLAllowed(check) || check.Path != "/check_sig" || check.Query().Get("ptsigx") == "" {
+		return nil, qqmusic.NewDataError("QQ 快速登录授权失败：clientkey 未被接受，请在 QQ 客户端重新登录后重试")
+	}
+
+	jar, _ = cookiejar.New(nil)
+	session := &qqLoginSession{jar: jar, created: time.Now(), referer: quick.referer}
+	cred, err := m.authorizeQQQR(ctx, check.String(), session)
+	if err != nil {
+		return nil, err
+	}
+	return cred, nil
+}
+
+func mustURL(raw string) *url.URL {
+	u, _ := url.Parse(raw)
+	return u
+}
+
+func (m *LoginModule) qqQuickRequest(ctx context.Context, session *qqQuickSession, method, rawURL string, opt qqmusic.HTTPOption) (*qqmusic.RawResponse, error) {
+	u, _ := url.Parse(rawURL)
+	opt.Cookies, opt.Credential, opt.NoRedirect = map[string]string{}, &qqmusic.Credential{}, true
+	if token := session.jar.Cookies(u); len(token) > 0 {
+		for _, c := range token {
+			switch c.Name {
+			case "pt_local_token", "pt_login_sig", "clientkey", "clientuin":
+				opt.Cookies[c.Name] = c.Value
+			}
+		}
+	}
+	if session.token != "" {
+		opt.Cookies["pt_local_token"] = session.token
+	}
+	resp, err := m.cl.DoHTTPPlainContext(ctx, method, rawURL, opt)
+	if err != nil {
+		return nil, qqmusic.AsAPIError(err)
+	}
+	session.jar.SetCookies(u, (&http.Response{Header: resp.Headers}).Cookies())
+	return resp, nil
+}
+
 // 每张二维码独占 cookie jar。pt_login_sig/qrsig/中间响应 Cookie 必须跨轮询保存；
 // Cookie 的 Domain/Path/过期信息也必须保留，不能用全局或按名称合并的 map。
 type qqLoginSession struct {

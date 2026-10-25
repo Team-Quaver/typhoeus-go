@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/team-quaver/typhoeus-go/inhibit"
@@ -104,6 +105,8 @@ func (a *App) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /{$}", a.handleRoot)
 
 	// 登录
+	mux.HandleFunc("GET /login/qq-quick", a.handleLoginQQQuickDetect)
+	mux.HandleFunc("POST /login/qq-quick", a.handleLoginQQQuick)
 	mux.HandleFunc("GET /login/qrcode/{login_type}", a.handleLoginQrcode)
 	mux.HandleFunc("GET /login/qrcode/{login_type}/status", a.handleLoginQrcodeStatus)
 	mux.HandleFunc("GET /login/status", a.handleLoginStatus)
@@ -277,6 +280,43 @@ func serializeQR(qr *modules.QR) map[string]any {
 		"data":       data,
 		"img":        "data:" + qr.Mimetype + ";base64," + data,
 	}
+}
+
+func (a *App) handleLoginQQQuickDetect(w http.ResponseWriter, r *http.Request) {
+	account, err := a.login.DetectQQQuick(r.Context())
+	if err != nil {
+		e := qqmusic.AsAPIError(err)
+		// 「没有本机 QQ」不是错误：UI 拿 available=false 就降级二维码。
+		if e.Kind == qqmusic.ErrKindData && strings.Contains(e.Message, "未检测到 QQ 客户端") {
+			writeOK(w, map[string]any{"available": false})
+			return
+		}
+		writeError(w, err)
+		return
+	}
+	writeOK(w, map[string]any{
+		"available": true,
+		"uin":       account.UIN,
+		"nickname":  account.Nickname,
+		"avatar":    account.Avatar,
+	})
+}
+
+func (a *App) handleLoginQQQuick(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		UIN int64 `json:"uin"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.UIN <= 0 {
+		writeErr(w, 422, -1, "缺少有效的 uin")
+		return
+	}
+	cred, err := a.login.LoginQQQuick(r.Context(), body.UIN)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	a.session.Adopt(cred)
+	writeOK(w, map[string]any{"logged_in": true, "credential": jsonableCredential(cred)})
 }
 
 func (a *App) handleLoginQrcode(w http.ResponseWriter, r *http.Request) {
