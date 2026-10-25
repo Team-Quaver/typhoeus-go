@@ -5,8 +5,9 @@ package server
 // - resolve → 协商出可播流（会员门控 + rank 回退 + 首块嗅探；加密档在内存解密）
 // - 中继端点持 token 透传 Range（vkey 不出后端；token 有 TTL，播放中命中即续期）
 //
-// 加密边界：解密仅驻内存。ekey 只在协商时短暂存在；中继按 Range 分片解密直推，
-// 全链路没有「解密后整文件」的内存峰值，也没有任何磁盘写入。
+// 加密边界：ekey 只在协商时短暂存在；中继按 Range 分片解密直推，全链路没有
+// 「解密后整文件」的内存峰值。除 cache/music/*.quaverlocalcache 的本地加密缓存外，
+// 播放链路没有任何明文磁盘写入。
 import (
 	"crypto/rand"
 	"encoding/base64"
@@ -126,6 +127,7 @@ type streamResolveBody struct {
 	Deprioritize []string `json:"deprioritize"` // 回退链降权档位（UI「回退排序」开关）
 	Platform     string   `json:"platform"`     // 取链平台身份：android(缺省)/web/desktop——严格曲库的版权判定与此相关
 	DurationMs   int64    `json:"duration_ms"`  // 曲长提示（秒×1000）：中继限速的实时倍率据此推算；缺省按整曲 ≥2 分钟兜底
+	CacheSeed    string   `json:"cache_seed"`   // 前端缓存密钥半种；空 = 本次播放不参与磁盘缓存
 }
 
 func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
@@ -139,6 +141,23 @@ func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Tier == "" {
 		body.Tier = "128"
+	}
+	if body.CacheSeed != "" {
+		if err := a.cacheSetSeed(body.CacheSeed); err == nil {
+			if tok, item, cerr := a.cacheTryResolve(body.Mid, body.CacheSeed); cerr == nil && item != nil {
+				writeOK(w, map[string]any{
+					"token":      tok,
+					"path":       "/cache/music/stream/" + tok,
+					"tier":       item.Tier,
+					"tier_label": item.Tier,
+					"mime":       cachePlainMime(item.Mime),
+					"size":       item.Size,
+					"cached":     true,
+					"degraded":   false,
+				})
+				return
+			}
+		}
 	}
 	resolved, err := a.resolver.Resolve(r.Context(), body.Mid, body.MediaMid, body.Tier,
 		body.Auto, body.Deprioritize, body.Platform, body.SongType)
@@ -157,8 +176,7 @@ func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
 	a.purgeExpired()
 	token := newToken()
 	now := time.Now()
-	a.streamMu.Lock()
-	a.streams[token] = &streamEntry{
+	entry := &streamEntry{
 		mid:        resolved.Mid,
 		url:        resolved.URL,
 		mime:       resolved.Tier.Mime,
@@ -174,7 +192,12 @@ func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
 		requested:  resolved.RequestedTier.ID,
 		durationMs: body.DurationMs,
 	}
+	a.streamMu.Lock()
+	a.streams[token] = entry
 	a.streamMu.Unlock()
+	if body.CacheSeed != "" {
+		go a.cacheStore(entry, body.Mid, body.CacheSeed, body.DurationMs)
+	}
 	// mid 粒度限速桶：resolve 即建档（换档刷新倍率），跨 token 共享，重取链接刷不出额度
 	a.paceBucket(resolved.Mid, paceRateFor(total, body.DurationMs))
 

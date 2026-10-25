@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/team-quaver/typhoeus-go/inhibit"
 	"github.com/team-quaver/typhoeus-go/qqmusic"
@@ -51,6 +52,11 @@ type App struct {
 	// 随 purgeExpired 的空闲清扫回收。
 	paceMu  sync.Mutex
 	paceMap map[string]*byteBucket
+
+	// 本地音乐缓存（弱网优化）：磁盘数据在 cache/music/*.quaverlocalcache，
+	// 前端 seed 只驻渲染层；cacheLimit 为用户设置的上限（字节，0=默认）。
+	musicCache *musicCache
+	cacheLimit *atomic.Int64
 }
 
 // NewApp 组装应用。
@@ -93,6 +99,8 @@ func NewApp() (*App, error) {
 		mobileStates: map[string]*mobileQRState{},
 		streams:      map[string]*streamEntry{},
 		paceMap:      map[string]*byteBucket{},
+		musicCache:   newMusicCache(),
+		cacheLimit:   &atomic.Int64{},
 	}
 	return app, nil
 }
@@ -125,6 +133,11 @@ func (a *App) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /stream/tiers", a.handleStreamTiers)
 	mux.HandleFunc("POST /stream/resolve", a.handleStreamResolve)
 	mux.HandleFunc("GET /stream/{token}", a.handleStreamProxy)
+	mux.HandleFunc("POST /cache/seed", a.handleCacheSeed)
+	mux.HandleFunc("GET /cache/music/status", a.handleMusicCacheStatus)
+	mux.HandleFunc("POST /cache/music/clear", a.handleMusicCacheClear)
+	mux.HandleFunc("POST /cache/music/limit", a.handleMusicCacheSetLimit)
+	mux.HandleFunc("GET /cache/music/stream/{token}", a.handleMusicCacheStream)
 	mux.HandleFunc("POST /sound-power/report", a.handleSoundPowerReport)
 
 	// 歌曲
