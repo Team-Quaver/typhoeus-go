@@ -118,13 +118,13 @@ func TestQQQRLoginChain(t *testing.T) {
 					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 						t.Fatal(err)
 					}
-					if body.Comm["ct"] != "24" || body.Req.Param["code"] != "CODE+VALUE" || body.Req.Method != "QQLogin" {
+					if body.Comm["ct"] != "19" || body.Req.Param["code"] != "CODE+VALUE" || body.Req.Method != "QQLogin" {
 						t.Fatalf("bad Web login: %+v", body)
 					}
 					requireCookie(t, r, "skey", "QQ_SKEY")
 					requireCookie(t, r, "login_type", "1")
 					wantGTK := strconv.FormatInt(qqmusic.Hash33("QQ_SKEY", 5381), 10)
-					if body.Comm["g_tk"] != wantGTK || body.Comm["g_tk_new_20200303"] != wantGTK {
+					if body.Comm["g_tk"] != wantGTK {
 						t.Fatal("music CGI must hash its own domain cookies")
 					}
 					if c, _ := r.Cookie("p_skey"); c != nil {

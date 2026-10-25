@@ -110,6 +110,7 @@ func (a *App) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /login/qrcode/{login_type}", a.handleLoginQrcode)
 	mux.HandleFunc("GET /login/qrcode/{login_type}/status", a.handleLoginQrcodeStatus)
 	mux.HandleFunc("GET /login/status", a.handleLoginStatus)
+	mux.HandleFunc("GET /login/probe", a.handleLoginProbe)
 	mux.HandleFunc("GET /login/refresh", a.handleLoginRefresh)
 	mux.HandleFunc("POST /login/logout", a.handleLoginLogout)
 
@@ -212,6 +213,14 @@ func (a *App) tryRefresh() bool {
 	cred, err := a.login.RefreshCredential(a.session.Credential())
 	if err != nil {
 		logWarn("凭证刷新失败: %v", err)
+		// 设备被手机端下线后，刷新会和普通请求一样报 1000/104400/104401；
+		// 此时本地凭证已不可恢复，直接下线，避免 UI 带着死凭证继续发请求。
+		e := qqmusic.AsAPIError(err)
+		// 登录域 CGI 把凭证错误归一为 ErrKindLogin（validateLoginResponse），两类都要接。
+		if e.Kind == qqmusic.ErrKindCredentialExpired || e.Kind == qqmusic.ErrKindCredentialInvalid ||
+			e.Kind == qqmusic.ErrKindLogin && (e.Code == 1000 || e.Code == 104400 || e.Code == 104401) {
+			a.session.Reject(e.Message)
+		}
 		return false
 	}
 	a.session.Adopt(cred)
@@ -501,6 +510,27 @@ func (a *App) handleLoginRefresh(w http.ResponseWriter, _ *http.Request) {
 	}
 	a.session.Adopt(cred)
 	writeOK(w, jsonableCredential(cred))
+}
+
+// handleLoginProbe 登录态探针：给前端周期性检查「设备被手机端下线」用。
+// 用凭证刷新本身探测：过期的 musickey 只读接口照常可用，只有刷新这类写路径
+// 会硬校验——因此它是唯一可靠的「凭证是否仍被服务端承认」信号。
+// 设备被下线时刷新报 1000/104400/104401，tryRefresh 已把本地登录态清掉。
+func (a *App) handleLoginProbe(w http.ResponseWriter, _ *http.Request) {
+	if _, err := a.session.Require(); err != nil {
+		writeError(w, err)
+		return
+	}
+	if !a.tryRefresh() {
+		if !a.session.LoggedIn() {
+			writeError(w, qqmusic.NewCredentialInvalidError("登录凭证已失效，请重新登录"))
+			return
+		}
+		// 刷新偶发失败（网络/上游抖动）不等同于被下线；下次探针再判。
+		writeOK(w, map[string]any{"online": true, "refreshed": false})
+		return
+	}
+	writeOK(w, map[string]any{"online": true, "refreshed": true})
 }
 
 func (a *App) handleLoginLogout(w http.ResponseWriter, _ *http.Request) {

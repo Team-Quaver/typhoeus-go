@@ -198,6 +198,19 @@ func (s *Session) Logout() error {
 	return nil
 }
 
+// Reject 服务端拒绝当前凭证时使用：不再回上游 Logout，直接清凭证并交接 null。
+func (s *Session) Reject(reason string) {
+	if !s.LoggedIn() {
+		return
+	}
+	if s.mode == ModeExternal {
+		s.emitCredential(nil)
+	}
+	s.setCred(&qqmusic.Credential{})
+	logInfo("凭证已被服务端拒绝，本地登录态已清除：%s", reason)
+	s.notify()
+}
+
 func (s *Session) setCred(cred *qqmusic.Credential) {
 	s.mu.Lock()
 	s.cred = cred

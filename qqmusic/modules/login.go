@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -119,8 +120,15 @@ func inferType(musicKey string) int64 {
 
 // loginCgi 发起登录域 CGI（带登录错误码白名单）。
 func (m *LoginModule) loginCgi(module, method string, param *qqmusic.JObj, comm *qqmusic.JObj) (json.RawMessage, error) {
+	if comm == nil {
+		comm = qqmusic.NewJObj()
+	}
+	if _, ok := comm.Get("ct"); !ok {
+		comm.Set("ct", 19).Set("cv", 2201)
+	}
 	item, err := m.cl.CgiCall(module, method, param, qqmusic.CGIOption{
 		Comm:            comm,
+		Platform:        qqmusic.PlatformDesktop,
 		AllowErrorCodes: allowLoginErrorCodes,
 	})
 	if err != nil {
@@ -566,12 +574,13 @@ func (m *LoginModule) authorizeQQQR(ctx context.Context, redirectURL string, ses
 			break
 		}
 	}
-	item, err := m.cl.CgiCall("QQConnectLogin.LoginServer", "QQLogin", qqmusic.NewJObj().Set("code", code), qqmusic.CGIOption{
-		Platform: qqmusic.PlatformWeb, Credential: &qqmusic.Credential{},
-		Comm:    qqmusic.NewJObj().Set("tmeLoginType", 2).Set("cv", 0).Set("platform", "yqq").Set("g_tk", gtk).Set("g_tk_new_20200303", gtk),
-		Cookies: musicCookies, Headers: map[string]string{"Referer": "https://y.qq.com/", "Origin": "https://y.qq.com"},
-		AllowErrorCodes: allowLoginErrorCodes,
-	})
+	item, err := m.cl.CgiCall("QQConnectLogin.LoginServer", "QQLogin",
+		qqmusic.NewJObj().Set("code", code).Set("deviceName", deviceDisplayName()), qqmusic.CGIOption{
+			Platform: qqmusic.PlatformDesktop, Credential: &qqmusic.Credential{},
+			Comm:    qqmusic.NewJObj().Set("tmeLoginType", 2).Set("g_tk", gtk),
+			Cookies: musicCookies, Headers: map[string]string{"Referer": "https://y.qq.com/", "Origin": "https://y.qq.com"},
+			AllowErrorCodes: allowLoginErrorCodes,
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -648,7 +657,7 @@ func (m *LoginModule) CheckWXQR(ctx context.Context, uuid string) (*QRLoginResul
 		return nil, qqmusic.NewDataError("获取 code 失败: 无效的 code")
 	}
 	item, err := m.loginCgi("music.login.LoginServer", "Login",
-		qqmusic.NewJObj().Set("code", status[2]).Set("strAppid", "wx48db31d50e334801"),
+		qqmusic.NewJObj().Set("code", status[2]).Set("strAppid", "wx48db31d50e334801").Set("deviceName", deviceDisplayName()),
 		qqmusic.NewJObj().Set("tmeLoginType", 1))
 	if err != nil {
 		return nil, err
@@ -678,15 +687,24 @@ func wxEventFromCode(code int) QRLoginEvent {
 
 // ===================== 手机客户端二维码（MQTT 推送） =====================
 
+// deviceDisplayName 登录/刷新时上报的本机设备名（QQ 音乐设备管理展示用）。
+func deviceDisplayName() string {
+	name, err := os.Hostname()
+	if err != nil || name == "" {
+		return "Quaver"
+	}
+	return name
+}
+
 // GetMobileQR 获取手机客户端扫码二维码（identifier 为 qrcodeID）。
 func (m *LoginModule) GetMobileQR(ctx context.Context) (*QR, error) {
 	param := qqmusic.NewJObj().
 		Set("tmeAppID", "qqmusic").
-		Set("ct", 11).
-		Set("cv", 14090008)
+		Set("ct", 19).
+		Set("cv", 2201).
+		Set("deviceName", deviceDisplayName())
 	item, err := m.cl.CgiCall("music.login.LoginServer", "CreateQRCode", param, qqmusic.CGIOption{
-		Comm:            qqmusic.NewJObj().Set("ct", 23).Set("cv", 0),
-		Platform:        qqmusic.PlatformAndroid,
+		Platform:        qqmusic.PlatformDesktop,
 		AllowErrorCodes: []int{},
 	})
 	if err != nil {
@@ -821,7 +839,8 @@ func (m *LoginModule) ConsumeMobileQR(ctx context.Context, qrcodeID string) (<-c
 					qqmusic.NewJObj().
 						Set("musicid", musicID).
 						Set("qrCodeID", qrcodeID).
-						Set("token", key),
+						Set("token", key).
+						Set("deviceName", deviceDisplayName()),
 					qqmusic.NewJObj().Set("tmeLoginType", 6))
 				if err != nil {
 					logWarn("mobile 扫码 Login CGI 失败: %v", err)
@@ -880,9 +899,11 @@ func (m *LoginModule) RefreshCredential(cred *qqmusic.Credential) (*qqmusic.Cred
 			Set("refresh_key", cred.RefreshKey).
 			Set("loginMode", 2)
 	}
+	param.Set("deviceName", deviceDisplayName())
 	item, err := m.cl.CgiCall("music.login.LoginServer", "Login", param, qqmusic.CGIOption{
-		Comm:            qqmusic.NewJObj().Set("tmeLoginType", cred.LoginType),
+		Comm:            qqmusic.NewJObj().Set("tmeLoginType", cred.LoginType).Set("ct", 19).Set("cv", 2201),
 		Credential:      cred,
+		Platform:        qqmusic.PlatformDesktop,
 		AllowErrorCodes: allowLoginErrorCodes,
 	})
 	if err != nil {
@@ -898,7 +919,7 @@ func (m *LoginModule) RefreshCredential(cred *qqmusic.Credential) (*qqmusic.Cred
 // Logout 登出（服务端注销 + 清凭证由上层处理）。
 func (m *LoginModule) Logout() error {
 	_, err := m.cl.CgiCall("music.login.LoginServer", "Logout", qqmusic.NewJObj(),
-		qqmusic.CGIOption{RequireLogin: true, AllowErrorCodes: allowLoginErrorCodes})
+		qqmusic.CGIOption{RequireLogin: true, Platform: qqmusic.PlatformDesktop, AllowErrorCodes: allowLoginErrorCodes})
 	return err
 }
 
