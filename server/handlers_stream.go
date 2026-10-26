@@ -144,16 +144,16 @@ func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.CacheSeed != "" {
 		if err := a.cacheSetSeed(body.CacheSeed); err == nil {
-			if tok, item, cerr := a.cacheTryResolve(body.Mid, body.CacheSeed); cerr == nil && item != nil {
+			if tok, item, cerr := a.cacheTryResolve(body.Mid, body.CacheSeed, body.Tier); cerr == nil && item != nil {
 				writeOK(w, map[string]any{
 					"token":      tok,
 					"path":       "/cache/music/stream/" + tok,
 					"tier":       item.Tier,
-					"tier_label": item.Tier,
+					"tier_label": tierLabel(item.Tier),
 					"mime":       cachePlainMime(item.Mime),
 					"size":       item.Size,
 					"cached":     true,
-					"degraded":   false,
+					"degraded":   item.Tier != body.Tier,
 				})
 				return
 			}
@@ -213,6 +213,15 @@ func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
 		"filename":       resolved.Filename,
 		"encrypted":      resolved.Encrypted,
 	})
+}
+
+// tierLabel 缓存条目只存稳定 id，标签按当前档位表取；未知 id 原样返回便于排障。
+func tierLabel(id string) string {
+	t, err := typhoeus.TierByID(id)
+	if err != nil {
+		return id
+	}
+	return t.Label
 }
 
 // handleStreamProxy Range 透传中继（<audio> src 指这里；vkey/ekey 留在后端）。

@@ -2,9 +2,15 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/team-quaver/typhoeus-go/qqmusic"
 )
 
 func TestCacheIndexRoundTrip(t *testing.T) {
@@ -62,5 +68,85 @@ func TestCacheMidMatchAndLimit(t *testing.T) {
 	}
 	if cacheKey("short", seed, "x") != nil {
 		t.Fatal("short disk seed must be rejected")
+	}
+}
+
+func TestCacheOnlyHitsExactTier(t *testing.T) {
+	dir := t.TempDir()
+	c := &musicCache{dir: dir, readers: map[string]*cacheReader{}}
+	if ok, err := c.openLocked(false); err != nil || !ok {
+		t.Fatalf("open: %v", err)
+	}
+	c.idx.Items = append(c.idx.Items, cacheEntry{
+		ID: randomTag(), UserID: -1, MidMAC: cacheMidMAC(c.seed, "m1"), Tier: "320", Size: 100,
+	})
+	app := &App{musicCache: c, session: &Session{cred: &qqmusic.Credential{}}}
+	seed := "0123456789abcdef0123456789abcdef"
+
+	tok, item, err := app.cacheTryResolve("m1", seed, "320")
+	if err != nil || tok == "" || item == nil || item.Tier != "320" {
+		t.Fatalf("same tier must hit: tok=%q item=%+v err=%v", tok, item, err)
+	}
+	if tok, item, err := app.cacheTryResolve("m1", seed, "flac"); err != nil || tok != "" || item != nil {
+		t.Fatalf("different tier must miss: tok=%q item=%+v err=%v", tok, item, err)
+	}
+}
+
+func TestStreamResolveCacheHitKeepsExactTier(t *testing.T) {
+	dir := t.TempDir()
+	c := &musicCache{dir: dir, readers: map[string]*cacheReader{}}
+	if ok, err := c.openLocked(false); err != nil || !ok {
+		t.Fatalf("open: %v", err)
+	}
+	app := &App{musicCache: c, session: &Session{cred: &qqmusic.Credential{}}}
+	seed := "0123456789abcdef0123456789abcdef"
+	if err := app.cacheSetSeed(seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	c.idx.Items = append(c.idx.Items, cacheEntry{
+		ID: randomTag(), UserID: -1, MidMAC: cacheMidMAC(c.seed, "m1"), Tier: "320", Mime: "audio/mpeg", Size: 100,
+	})
+	body := `{"mid":"m1","media_mid":"m1","tier":"320","auto":true,"cache_seed":"` + seed + `"}`
+	rec := httptest.NewRecorder()
+
+	app.handleStreamResolve(rec, httptest.NewRequest(http.MethodPost, "/stream/resolve", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data struct {
+			Tier      string `json:"tier"`
+			TierLabel string `json:"tier_label"`
+			Degraded  bool   `json:"degraded"`
+			Cached    bool   `json:"cached"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Data.Tier != "320" || out.Data.TierLabel != "高品质 HQ" || !out.Data.Cached || out.Data.Degraded {
+		t.Fatalf("unexpected cache response: %+v", out.Data)
+	}
+}
+
+func TestCacheStoresTierVariantsSeparately(t *testing.T) {
+	dir := t.TempDir()
+	c := &musicCache{dir: dir, readers: map[string]*cacheReader{}}
+	if ok, err := c.openLocked(false); err != nil || !ok {
+		t.Fatalf("open: %v", err)
+	}
+	mac := cacheMidMAC(c.seed, "m1")
+	c.idx.Items = append(c.idx.Items,
+		cacheEntry{ID: randomTag(), UserID: -1, MidMAC: mac, Tier: "320"},
+		cacheEntry{ID: randomTag(), UserID: -1, MidMAC: mac, Tier: "flac"},
+	)
+	app := &App{musicCache: c, session: &Session{cred: &qqmusic.Credential{}}}
+	seed := "0123456789abcdef0123456789abcdef"
+
+	for _, tier := range []string{"320", "flac"} {
+		if tok, item, err := app.cacheTryResolve("m1", seed, tier); err != nil || tok == "" || item == nil || item.Tier != tier {
+			t.Fatalf("%s must hit its own cache: tok=%q item=%+v err=%v", tier, tok, item, err)
+		}
 	}
 }

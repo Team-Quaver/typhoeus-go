@@ -309,7 +309,10 @@ func (c *musicCache) fileOf(e cacheEntry) string {
 	return filepath.Join(c.dir, e.ID+cacheFileExt)
 }
 
-func (a *App) cacheTryResolve(mid, frontendSeed string) (string, *cacheEntry, error) {
+// cacheTryResolve 只返回与目标档位相同的缓存。
+// 缓存的是某一档的完整音频，不是“这首歌随便一份”；若忽略 tier，用户切到 320/SQ/母带
+// 仍会命中旧的 128/320 文件，UI 看似换了档、实际音质完全没变。
+func (a *App) cacheTryResolve(mid, frontendSeed, tier string) (string, *cacheEntry, error) {
 	if frontendSeed == "" {
 		return "", nil, nil
 	}
@@ -322,11 +325,9 @@ func (a *App) cacheTryResolve(mid, frontendSeed string) (string, *cacheEntry, er
 		return "", nil, err
 	}
 	for _, e := range c.idx.Items {
-		if e.UserID != uid || !cacheSameMAC(cacheMidMAC(c.seed, mid), e.MidMAC) {
+		if e.UserID != uid || e.Tier != tier || !cacheSameMAC(cacheMidMAC(c.seed, mid), e.MidMAC) {
 			continue
 		}
-		// 档位不同也算命中：缓存的是这首歌已可播的一份完整数据。命中后返回实际 tier，
-		// UI 的音质徽章跟随实际档位，不伪造请求档。
 		key := cacheKey(c.seed, frontendSeed, "data:"+e.ID)
 		if key == nil {
 			return "", nil, errCacheSeed
