@@ -6,6 +6,7 @@ Quaver Typhoeus 的 Golang 服务后端。替代 L-1124 版 Python API 服务端
 
 - **登录**：QQ 二维码 / 微信二维码 / QQ 音乐手机客户端扫码（MQTT 5.0 over WSS 推送）+ 凭证自动刷新 + 登出
 - **账号**：主页信息、VIP 会员信息、我喜欢（红心列表）、自建歌单、收藏歌单
+- **音乐网盘**：GetMatchAudio 分页读取、在线刮削、导入歌词/封面、自定义展示信息
 - **播放流（Typhoeus）**：
   - 明文高阶档位全开：标准 128 → HQ → SQ(FLAC/OGG 640) → **臻品音质 2.0 / 全景声 5.1 / 7.1 / 母带 / DTS:X / 杜比全景声(AC-4)**
   - **加密档位解密播放**（黑胶/加密 FLAC/加密 OGG 等）：**全链路不落盘、无整文件内存峰值、ekey 不透传**
@@ -51,6 +52,14 @@ QUAVER_PORT=3200 ./typhoeus-go        # 默认 http://127.0.0.1:3200
 | GET  | `/login/status` / `/login/refresh` | 登录态 / 手动刷新凭证 |
 | POST | `/login/logout` | 登出 |
 | GET  | `/user/me` `/user/vip` `/user/liked` `/user/created-songlists` `/user/fav-songlists` | 账号信息 |
+| GET  | `/user/cloud` | 音乐网盘（兼容上游形状；`offset`/`limit`） |
+| GET  | `/cloud/library` | 音乐网盘完整快照（条目 + 统计 + 刮削进度） |
+| GET/POST | `/cloud/scrape` | 刮削进度 / 开始刮削 `{keys?,all?,force?}` |
+| POST | `/cloud/meta/set` | 自定义展示信息 `{key,title?,artist?,album?}` |
+| POST | `/cloud/playback` | 回写播放状态 `{key,state,error?}`（matched/resolved/blocked） |
+| POST/DELETE | `/cloud/lyric/import` · `/cloud/lyric/import/{key}` | 导入 / 撤销自定义歌词 |
+| POST | `/cloud/cover/import` | 导入自定义封面 |
+| GET  | `/cloud/lyric/{key}` `/cloud/cover/{key}` | 云盘歌词 / 封面资源 |
 | GET  | `/stream/tiers` | 会员等级 + 可播/全量档位表（含 `encrypted` 标记） |
 | POST | `/stream/resolve` | `{mid, media_mid?, tier, auto?, deprioritize?}` → 换取中继 token |
 | GET  | `/stream/{token}` | Range 透传中继（`<audio>` 的 src 指这里） |

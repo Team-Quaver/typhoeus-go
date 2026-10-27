@@ -25,6 +25,7 @@ type App struct {
 	login    *modules.LoginModule
 	song     *modules.SongModule
 	user     *modules.UserModule
+	cloud    *modules.CloudModule
 	songlist *modules.SonglistModule
 	recom    *modules.RecommendModule
 	top      *modules.TopModule
@@ -57,6 +58,13 @@ type App struct {
 	// 前端 seed 只驻渲染层；cacheLimit 为用户设置的上限（字节，0=默认）。
 	musicCache *musicCache
 	cacheLimit *atomic.Int64
+
+	// 音乐网盘刮削（异步任务状态；云盘条目本体仍由上游实时读取）
+	cloudMu            sync.RWMutex
+	cloudIndex         *cloudIndex
+	cloudScrapeMu      sync.Mutex
+	cloudScrape        cloudScrapeState
+	cloudScrapeRunning bool
 }
 
 // NewApp 组装应用。
@@ -86,6 +94,7 @@ func NewApp() (*App, error) {
 		login:        modules.NewLoginModule(sess.Client()),
 		song:         modules.NewSongModule(sess.Client()),
 		user:         modules.NewUserModule(sess.Client()),
+		cloud:        modules.NewCloudModule(sess.Client()),
 		songlist:     modules.NewSonglistModule(sess.Client()),
 		recom:        modules.NewRecommendModule(sess.Client()),
 		top:          modules.NewTopModule(sess.Client()),
@@ -126,8 +135,21 @@ func (a *App) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /user/me", a.handleUserMe)
 	mux.HandleFunc("GET /user/vip", a.handleUserVip)
 	mux.HandleFunc("GET /user/liked", a.handleUserLiked)
+	mux.HandleFunc("GET /user/cloud", a.handleUserCloud)
 	mux.HandleFunc("GET /user/created-songlists", a.handleUserCreatedSonglists)
 	mux.HandleFunc("GET /user/fav-songlists", a.handleUserFavSonglists)
+
+	// 音乐网盘（列表/刮削/自定义歌词与封面）
+	mux.HandleFunc("GET /cloud/library", a.handleCloudLibrary)
+	mux.HandleFunc("GET /cloud/scrape", a.handleCloudScrapeStatus)
+	mux.HandleFunc("POST /cloud/scrape", a.handleCloudScrapeStart)
+	mux.HandleFunc("POST /cloud/meta/set", a.handleCloudMetaSet)
+	mux.HandleFunc("POST /cloud/playback", a.handleCloudPlayback)
+	mux.HandleFunc("POST /cloud/lyric/import", a.handleCloudLyricImport)
+	mux.HandleFunc("DELETE /cloud/lyric/import/{key}", a.handleCloudLyricRevert)
+	mux.HandleFunc("POST /cloud/cover/import", a.handleCloudCoverImport)
+	mux.HandleFunc("GET /cloud/lyric/{key}", a.handleCloudLyric)
+	mux.HandleFunc("GET /cloud/cover/{key}", a.handleCloudCover)
 
 	// 播放流（Typhoeus：高档位协商 + 会员门控 + Range 中继 + 加密流解密）
 	mux.HandleFunc("GET /stream/tiers", a.handleStreamTiers)
