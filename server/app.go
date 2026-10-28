@@ -18,9 +18,18 @@ import (
 
 // App sidecar 主应用：会话 + 各业务模块 + Typhoeus 协商器 + 中继 token 表。
 type App struct {
-	session  *Session
-	provider *typhoeus.QQMusicProvider
-	resolver *typhoeus.StreamResolver
+	session         *Session
+	provider        *typhoeus.QQMusicProvider
+	resolver        *typhoeus.StreamResolver
+	weiyunStore     *weiyunStore
+	weiyunTicketsMu sync.Mutex
+	weiyunTickets   map[string]*weiyunTicket
+	weiyunIndexMu   sync.Mutex
+	weiyunIndex     *weiyunIndexCache
+	weiyunIndexLoad chan struct{}
+	weiyunIndexGen  uint64
+	weiyunAuthMu    sync.Mutex
+	weiyunAuthFlow  *weiyunAuthFlow
 
 	login    *modules.LoginModule
 	song     *modules.SongModule
@@ -88,28 +97,30 @@ func NewApp() (*App, error) {
 	// 登录/登出后会员缓存立即失效
 	sess.OnCredentialChange(provider.InvalidateMembership)
 	app := &App{
-		session:      sess,
-		provider:     provider,
-		resolver:     resolver,
-		login:        modules.NewLoginModule(sess.Client()),
-		song:         modules.NewSongModule(sess.Client()),
-		user:         modules.NewUserModule(sess.Client()),
-		cloud:        modules.NewCloudModule(sess.Client()),
-		songlist:     modules.NewSonglistModule(sess.Client()),
-		recom:        modules.NewRecommendModule(sess.Client()),
-		top:          modules.NewTopModule(sess.Client()),
-		lyric:        modules.NewLyricModule(sess.Client()),
-		search:       modules.NewSearchModule(sess.Client()),
-		album:        modules.NewAlbumModule(sess.Client()),
-		singer:       modules.NewSingerModule(sess.Client()),
-		comment:      modules.NewCommentModule(sess.Client()),
-		inhibitSleep: inhibit.New(),
-		inhibitIdle:  inhibit.NewWithMode(inhibit.ModeIdle),
-		mobileStates: map[string]*mobileQRState{},
-		streams:      map[string]*streamEntry{},
-		paceMap:      map[string]*byteBucket{},
-		musicCache:   newMusicCache(),
-		cacheLimit:   &atomic.Int64{},
+		session:       sess,
+		provider:      provider,
+		resolver:      resolver,
+		weiyunStore:   &weiyunStore{},
+		weiyunTickets: map[string]*weiyunTicket{},
+		login:         modules.NewLoginModule(sess.Client()),
+		song:          modules.NewSongModule(sess.Client()),
+		user:          modules.NewUserModule(sess.Client()),
+		cloud:         modules.NewCloudModule(sess.Client()),
+		songlist:      modules.NewSonglistModule(sess.Client()),
+		recom:         modules.NewRecommendModule(sess.Client()),
+		top:           modules.NewTopModule(sess.Client()),
+		lyric:         modules.NewLyricModule(sess.Client()),
+		search:        modules.NewSearchModule(sess.Client()),
+		album:         modules.NewAlbumModule(sess.Client()),
+		singer:        modules.NewSingerModule(sess.Client()),
+		comment:       modules.NewCommentModule(sess.Client()),
+		inhibitSleep:  inhibit.New(),
+		inhibitIdle:   inhibit.NewWithMode(inhibit.ModeIdle),
+		mobileStates:  map[string]*mobileQRState{},
+		streams:       map[string]*streamEntry{},
+		paceMap:       map[string]*byteBucket{},
+		musicCache:    newMusicCache(),
+		cacheLimit:    &atomic.Int64{},
 	}
 	return app, nil
 }
@@ -150,6 +161,14 @@ func (a *App) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /cloud/cover/import", a.handleCloudCoverImport)
 	mux.HandleFunc("GET /cloud/lyric/{key}", a.handleCloudLyric)
 	mux.HandleFunc("GET /cloud/cover/{key}", a.handleCloudCover)
+
+	// 微云文件域（MCP token；独立于 QQ 音乐 musickey）
+	mux.HandleFunc("GET /weiyun/status", a.handleWeiyunStatus)
+	mux.HandleFunc("POST /weiyun/auth", a.handleWeiyunAuthSet)
+	mux.HandleFunc("POST /weiyun/auth/start", a.handleWeiyunAuthStart)
+	mux.HandleFunc("POST /weiyun/auth/poll", a.handleWeiyunAuthPoll)
+	mux.HandleFunc("DELETE /weiyun/auth", a.handleWeiyunAuthClear)
+	mux.HandleFunc("GET /weiyun/music/{fileID}", a.handleWeiyunMusicFile)
 
 	// 播放流（Typhoeus：高档位协商 + 会员门控 + Range 中继 + 加密流解密）
 	mux.HandleFunc("GET /stream/tiers", a.handleStreamTiers)

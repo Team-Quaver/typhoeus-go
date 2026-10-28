@@ -104,7 +104,7 @@ type cloudStats struct {
 
 type cloudItemView struct {
 	Key           string          `json:"key"`
-	FileID        string          `json:"-"`
+	FileID        string          `json:"fileId"`
 	FileName      string          `json:"fileName"`
 	AddTime       int64           `json:"addTime"`
 	Matched       int             `json:"matched"`
@@ -247,6 +247,13 @@ func cloudMatched(v any) int {
 	default:
 		return 0
 	}
+}
+
+// cloudPlayable: a file_id is enough to locate and stream the original upload.
+// matched=2 only means QQ Music has no library match; it does not make the
+// Weiyun file itself unplayable.
+func cloudPlayable(fileID string, _ int) bool {
+	return strings.TrimSpace(fileID) != ""
 }
 
 func cloudSongObj(raw json.RawMessage) obj {
@@ -404,7 +411,7 @@ func (a *App) cloudEntries(pageNo int) ([]cloudEntry, int, bool, error) {
 		}
 		songRaw, _ := json.Marshal(m["song_info"])
 		matched := cloudMatched(firstOf(m, "matched"))
-		playable := strOf(cloudSongObj(songRaw), "mid") != "" && matched != cloudMatchedOriginalFile
+		playable := cloudPlayable(fileID, matched)
 		key := cloudKeyOf(cloudAccountKey(a.session.Credential()), fileID)
 		entries = append(entries, cloudEntry{
 			Key: key, FileID: fileID, FileName: cloudDecodeName(firstOf(m, "filename")),
@@ -505,7 +512,7 @@ func (a *App) handleCloudLibrary(w http.ResponseWriter, r *http.Request) {
 			LyricImport: m.LyricImport, ImportFormat: m.ImportFormat,
 			HasCover: hasCover, HasLyric: hasLyric,
 			PlaybackState: m.PlaybackState, PlaybackError: m.PlaybackError,
-			Song: e.Song,
+			Song: e.Song, FileID: e.FileID,
 		}
 		items = append(items, item)
 		if item.Playable {

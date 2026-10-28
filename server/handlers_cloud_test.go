@@ -45,12 +45,14 @@ func TestCloudAddTime(t *testing.T) {
 }
 
 func TestCloudMatchedAndPlayable(t *testing.T) {
-	entry := cloudEntry{
-		Song:    json.RawMessage(`{"mid":"M1"}`),
-		Matched: cloudMatchedOriginalFile,
+	if cloudMatched(json.Number("2")) != cloudMatchedOriginalFile {
+		t.Fatal("matched=2 应识别为原文件")
 	}
-	if entry.Matched != 2 {
-		t.Fatalf("matched=2 应识别为原文件: %d", entry.Matched)
+	if !cloudPlayable("file-original", cloudMatchedOriginalFile) {
+		t.Fatal("matched=2 且有 file_id 时应可播放原文件")
+	}
+	if cloudPlayable("", cloudMatchedOriginalFile) {
+		t.Fatal("缺少 file_id 时不可播放")
 	}
 }
 
@@ -76,6 +78,27 @@ func TestCloudPlaybackStateRoute(t *testing.T) {
 		strings.NewReader(`{"key":"`+key+`","state":"playing"}`)))
 	if bad.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("非法状态应拒绝，got %d", bad.Code)
+	}
+}
+
+func TestCloudMetaSetPreservesExistingFields(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("QUAVER_CONFIG_DIR", dir)
+	key := cloudKeyOf("10001", "file-meta")
+	app := &App{cloudIndex: &cloudIndex{Version: 1, Items: map[string]*cloudMeta{
+		key: {Key: key, Title: "Old", Artist: "Old Artist", Album: "Old Album"},
+	}}}
+
+	body := `{"key":"` + key + `","title":"New","artist":"","album":"New Album"}`
+	rec := httptest.NewRecorder()
+	app.handleCloudMetaSet(rec, httptest.NewRequest(http.MethodPost, "/cloud/meta/set", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	meta := app.cloudIndex.Items[key]
+	if meta.Title != "New" || meta.Artist != "Old Artist" || meta.Album != "New Album" || !meta.EditedMeta {
+		t.Fatalf("meta update = %+v", meta)
 	}
 }
 
@@ -264,7 +287,7 @@ func TestCloudEntriesFromUpstreamShape(t *testing.T) {
 	if mid := strOf(cloudSongObj(songRaw), "mid"); mid != "M1" {
 		t.Fatalf("mid = %q", mid)
 	}
-	if mid := strOf(cloudSongObj(songRaw), "mid"); mid == "" || cloudMatched(m["matched"]) == cloudMatchedOriginalFile {
-		t.Fatal("matched=1 + mid 应判可播放")
+	if mid := strOf(cloudSongObj(songRaw), "mid"); mid == "" || !cloudPlayable(fileID, cloudMatched(m["matched"])) {
+		t.Fatal("有 file_id 的条目应判可播放")
 	}
 }

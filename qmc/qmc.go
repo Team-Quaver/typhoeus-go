@@ -47,3 +47,8 @@ func DecryptFile(data []byte, masterKey []byte) ([]byte, error) {
 func DecryptV1File(data []byte) []byte {
 	return mapTransform(data, 0, &v1StaticKey)
 }
+
+// DecryptV1InPlace 用全局静态密钥就地解密一段数据（offset = 该段在密文中的绝对偏移）。
+func DecryptV1InPlace(data []byte, offset int64) {
+	xorMapInPlace(data, offset, doubleKey(&v1StaticKey))
+}
