@@ -245,7 +245,8 @@ func (a *App) call(needLogin bool, fn func() (json.RawMessage, error)) (json.Raw
 
 // tryRefresh 尝试刷新凭证并交接；成功返回 true。
 func (a *App) tryRefresh() bool {
-	cred, err := a.login.RefreshCredential(a.session.Credential())
+	expected, gen := a.session.CredentialWithGeneration()
+	cred, err := a.login.RefreshCredential(expected)
 	if err != nil {
 		logWarn("凭证刷新失败: %v", err)
 		// 设备被手机端下线后，刷新会和普通请求一样报 1000/104400/104401；
@@ -254,13 +255,12 @@ func (a *App) tryRefresh() bool {
 		// 登录域 CGI 把凭证错误归一为 ErrKindLogin（validateLoginResponse），两类都要接。
 		if e.Kind == qqmusic.ErrKindCredentialExpired || e.Kind == qqmusic.ErrKindCredentialInvalid ||
 			e.Kind == qqmusic.ErrKindLogin && (e.Code == 1000 || e.Code == 104400 || e.Code == 104401) {
-			a.session.Reject(e.Message)
+			a.session.RejectIfGeneration(gen, e.Message)
 		}
 		return false
 	}
-	a.session.Adopt(cred)
-	logInfo("凭证已自动刷新 musicid=%d", cred.MusicID)
-	return true
+	// 刷新期间可能已经登出/换号：晚到的旧凭证绝不能写回会话。
+	return a.session.AdoptIfGeneration(gen, cred)
 }
 
 // requireEuin 登录守卫 + 加密 UIN。

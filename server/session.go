@@ -78,8 +78,11 @@ type Session struct {
 	mu   sync.RWMutex
 	mode CredentialMode
 	cred *qqmusic.Credential
-	cl   *qqmusic.Client
-	out  *bufio.Writer
+	// gen 凭证代际：每次写入 +1。刷新在网络上可能比登出更晚返回，AdoptIfGeneration
+	// 用它拒绝「登录态已经翻篇」的旧结果，避免旧账号被刷新结果复活。
+	gen uint64
+	cl  *qqmusic.Client
+	out *bufio.Writer
 
 	listeners   []func()
 	listenersMu sync.Mutex
@@ -152,6 +155,14 @@ func (s *Session) Credential() *qqmusic.Credential {
 	return s.cred
 }
 
+// CredentialWithGeneration 返回凭证快照与代际。异步刷新必须在发起前记下它，
+// 返回后用 AdoptIfGeneration 校验登录态没有被登出/换号翻篇。
+func (s *Session) CredentialWithGeneration() (*qqmusic.Credential, uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cred, s.gen
+}
+
 // LoggedIn 是否已登录。
 func (s *Session) LoggedIn() bool { return s.Credential().HasLogin() }
 
@@ -183,18 +194,68 @@ func (s *Session) Adopt(cred *qqmusic.Credential) {
 	s.notify()
 }
 
-// Logout 登出：上游注销 + 清本地凭证 + 交接 null。
-func (s *Session) Logout() error {
-	if s.LoggedIn() {
-		if err := modulesLogin(s.cl).Logout(); err != nil {
-			logWarn("上游登出失败，仅清除本地凭证: %v", err)
-		}
+// AdoptIfGeneration 仅当凭证代际仍是发起刷新时的值才写入。
+// 返回 false = 期间已登出/换号，刷新结果必须丢弃。
+func (s *Session) AdoptIfGeneration(gen uint64, cred *qqmusic.Credential) bool {
+	s.mu.Lock()
+	if s.gen != gen {
+		s.mu.Unlock()
+		logInfo("丢弃过期的凭证刷新结果：登录态已变化")
+		return false
 	}
+	s.cred = cred
+	s.gen++
+	s.mu.Unlock()
+	s.cl.SetCredential(cred)
+	if s.mode == ModeExternal {
+		s.emitCredential(cred)
+	}
+	logInfo("凭证已自动刷新 musicid=%d", cred.MusicID)
+	s.notify()
+	return true
+}
+
+// RejectIfGeneration 仅当凭证代际未变化时清会话。
+// 与 AdoptIfGeneration 同理：旧账号的刷新失败不能把已重新登录的新账号踢下线。
+func (s *Session) RejectIfGeneration(gen uint64, reason string) bool {
+	s.mu.Lock()
+	if s.gen != gen {
+		s.mu.Unlock()
+		logInfo("忽略过期的凭证失效结果：登录态已变化")
+		return false
+	}
+	s.cred = &qqmusic.Credential{}
+	s.gen++
+	s.mu.Unlock()
+	s.cl.SetCredential(&qqmusic.Credential{})
+	if s.mode == ModeExternal {
+		s.emitCredential(nil)
+	}
+	logInfo("凭证已被服务端拒绝，本地登录态已清除：%s", reason)
+	s.notify()
+	return true
+}
+
+// Logout 登出：先清本地凭证并交接 null，再异步通知上游注销。
+//
+// 顺序不能反：上游 Logout 可能慢到超过前端 1.5s 的离场兜底。若先等上游，
+// 前端跳转后的新页面会从 /login/status 读到旧凭证，头像/侧栏被重新画回来。
+// 本地凭证是「谁还能继续用这台设备」的唯一真相，必须先失效；上游通知失败只记日志。
+func (s *Session) Logout() error {
+	cred := s.Credential()
+	hadLogin := cred.HasLogin()
 	if s.mode == ModeExternal {
 		s.emitCredential(nil)
 	}
 	s.setCred(&qqmusic.Credential{})
 	s.notify()
+	if hadLogin {
+		go func() {
+			if err := modulesLogin(s.cl).LogoutWithCredential(cred); err != nil {
+				logWarn("上游登出失败，本地凭证已清除: %v", err)
+			}
+		}()
+	}
 	return nil
 }
 
@@ -214,6 +275,7 @@ func (s *Session) Reject(reason string) {
 func (s *Session) setCred(cred *qqmusic.Credential) {
 	s.mu.Lock()
 	s.cred = cred
+	s.gen++
 	s.mu.Unlock()
 	s.cl.SetCredential(cred)
 }

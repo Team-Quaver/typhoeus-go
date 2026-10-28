@@ -916,10 +916,16 @@ func (m *LoginModule) RefreshCredential(cred *qqmusic.Credential) (*qqmusic.Cred
 	return newCred, nil
 }
 
-// Logout 登出（服务端注销 + 清凭证由上层处理）。
+// Logout 登出当前凭证（服务端注销 + 清凭证由上层处理）。
 func (m *LoginModule) Logout() error {
+	return m.LogoutWithCredential(nil)
+}
+
+// LogoutWithCredential 用指定凭证通知上游注销。传 nil 时取客户端当前凭证。
+// 单独收口是因为本地凭证可能已经先被清掉，而上游注销仍要用注销前的那一份。
+func (m *LoginModule) LogoutWithCredential(cred *qqmusic.Credential) error {
 	_, err := m.cl.CgiCall("music.login.LoginServer", "Logout", qqmusic.NewJObj(),
-		qqmusic.CGIOption{RequireLogin: true, Platform: qqmusic.PlatformDesktop, AllowErrorCodes: allowLoginErrorCodes})
+		qqmusic.CGIOption{Credential: cred, RequireLogin: true, Platform: qqmusic.PlatformDesktop, AllowErrorCodes: allowLoginErrorCodes})
 	return err
 }
 
