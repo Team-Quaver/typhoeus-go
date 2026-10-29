@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -147,6 +148,33 @@ func TestCacheStoresTierVariantsSeparately(t *testing.T) {
 	for _, tier := range []string{"320", "flac"} {
 		if tok, item, err := app.cacheTryResolve("m1", seed, tier); err != nil || tok == "" || item == nil || item.Tier != tier {
 			t.Fatalf("%s must hit its own cache: tok=%q item=%+v err=%v", tier, tok, item, err)
+		}
+	}
+}
+
+func TestMusicCacheCleanupRemovesTempAndOrphans(t *testing.T) {
+	c := &musicCache{dir: t.TempDir(), readers: map[string]*cacheReader{}}
+	keep := "0123456789abcdef0123456789abcdef"
+	keepName := keep + cacheFileExt
+	if err := os.WriteFile(filepath.Join(c.dir, keepName), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(c.dir, ".interrupted.tmp"), []byte("tmp"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(c.dir, "orphan"+cacheFileExt), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.idx.Items = []cacheEntry{{ID: keep}}
+
+	c.cleanupLocked()
+
+	if _, err := os.Stat(filepath.Join(c.dir, keepName)); err != nil {
+		t.Fatalf("referenced cache file was removed: %v", err)
+	}
+	for _, name := range []string{".interrupted.tmp", "orphan" + cacheFileExt} {
+		if _, err := os.Stat(filepath.Join(c.dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s should be removed, stat err = %v", name, err)
 		}
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/team-quaver/typhoeus-go/qmc"
@@ -40,9 +41,11 @@ type weiyunTicket struct {
 }
 
 type weiyunStreamSource struct {
-	ticket *weiyunTicket
-	app    *App
-	fileID string
+	mu          sync.Mutex
+	ticket      *weiyunTicket
+	app         *App
+	fileID      string
+	refreshTest func(context.Context, string, string, string) (*weiyunTicket, error)
 }
 
 // weiyunCipher adapts the stateless QMCv1 transform to the generic stream
@@ -55,17 +58,51 @@ func (weiyunCipher) Decrypt(data []byte, offset int64) []byte {
 	return out
 }
 
-func (s weiyunStreamSource) Refresh(ctx context.Context) (streamOpener, error) {
+func (s *weiyunStreamSource) ticketCopy() *weiyunTicket {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ticket == nil {
+		return nil
+	}
+	cp := *s.ticket
+	return &cp
+}
+
+// renew forces a new Weiyun download link. The cached link can still be
+// syntactically valid while its CDN URL has already returned 403, so expiry
+// alone is not enough to decide when to refresh.
+func (s *weiyunStreamSource) renew(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ticket == nil {
+		return errors.New("微云下载票据缺失")
+	}
+	pdirKey, name := s.ticket.PdirKey, s.ticket.Name
+	var ticket *weiyunTicket
+	var err error
+	if s.refreshTest != nil {
+		ticket, err = s.refreshTest(ctx, s.fileID, pdirKey, name)
+	} else {
+		s.app.invalidateWeiyunTicket(s.fileID, pdirKey)
+		ticket, err = s.app.weiyunDownloadTicketNamed(ctx, s.fileID, pdirKey, name)
+	}
+	if err != nil {
+		return err
+	}
+	s.ticket = ticket
+	return nil
+}
+
+func (s *weiyunStreamSource) Refresh(ctx context.Context) (streamOpener, error) {
+	ticket := s.ticketCopy()
+	if ticket == nil {
+		return s, errors.New("微云下载票据缺失")
+	}
 	// Avoid refreshing on every chunk; only react when the ticket is near expiry.
-	if time.Until(s.ticket.Expires) > time.Minute {
+	if time.Until(ticket.Expires) > time.Minute {
 		return s, nil
 	}
-	ticket, err := s.app.weiyunDownloadTicket(ctx, s.fileID, s.ticket.PdirKey)
-	if err != nil {
-		return s, err
-	}
-	ticket.Name = s.ticket.Name
-	return weiyunStreamSource{ticket: ticket, app: s.app, fileID: s.fileID}, nil
+	return s, s.renew(ctx)
 }
 
 func (weiyunCipher) DecryptInPlace(data []byte, offset int64) {
@@ -75,9 +112,24 @@ func (weiyunCipher) DecryptInPlace(data []byte, offset int64) {
 // Weiyun links can require a download cookie. This adapter lets the generic
 // stream proxy/cache path use the same Typhoeus opener without leaking that
 // cookie beyond the sidecar.
-func (s weiyunStreamSource) OpenRange(ctx context.Context, url string, rng *typhoeus.ByteRange) (*typhoeus.UpstreamResponse, error) {
-	t := s.ticket
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func (s *weiyunStreamSource) OpenRange(ctx context.Context, _ string, rng *typhoeus.ByteRange) (*typhoeus.UpstreamResponse, error) {
+	resp, err := s.open(ctx, rng)
+	if err != nil || (resp.Status != http.StatusForbidden && resp.Status != http.StatusNotFound) {
+		return resp, err
+	}
+	_ = resp.Body.Close()
+	if rerr := s.renew(ctx); rerr != nil {
+		return nil, rerr
+	}
+	return s.open(ctx, rng)
+}
+
+func (s *weiyunStreamSource) open(ctx context.Context, rng *typhoeus.ByteRange) (*typhoeus.UpstreamResponse, error) {
+	t := s.ticketCopy()
+	if t == nil {
+		return nil, errors.New("微云下载票据缺失")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.URL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -166,6 +218,12 @@ func (a *App) weiyunFileIndex(ctx context.Context) (*weiyunIndexCache, error) {
 	if err == nil {
 		idx, err = c.IndexFiles(ctx, weiyun.IndexOptions{})
 	}
+	if err == nil && idx != nil {
+		// Persist the whole scan once in the background. Otherwise every app
+		// restart throws away the in-memory location map and the first cloud
+		// play pays for a full drive walk again.
+		go a.rememberCloudLocations(weiyunLocationsOf(idx.Files))
+	}
 
 	a.weiyunIndexMu.Lock()
 	if err == nil && gen == a.weiyunIndexGen {
@@ -188,6 +246,14 @@ func (a *App) weiyunFileIndex(ctx context.Context) (*weiyunIndexCache, error) {
 	return cache, nil
 }
 
+func weiyunLocationsOf(files map[string]weiyun.IndexedFile) map[string]cloudLocation {
+	locations := make(map[string]cloudLocation, len(files))
+	for fileID, f := range files {
+		locations[fileID] = cloudLocation{PdirKey: f.PdirKey, FileName: f.FileName}
+	}
+	return locations
+}
+
 func (a *App) weiyunIndexedFile(ctx context.Context, fileID string) (*weiyun.IndexedFile, error) {
 	idx, err := a.weiyunFileIndex(ctx)
 	if err != nil {
@@ -198,6 +264,72 @@ func (a *App) weiyunIndexedFile(ctx context.Context, fileID string) (*weiyun.Ind
 		return nil, errors.New("微云目录中找不到该文件")
 	}
 	return &f, nil
+}
+
+// warmWeiyunTickets fetches short-lived download URLs for the whole cloud page
+// in one batch. Resolving each track separately costs one MCP round trip on the
+// first switch; batching moves that latency to the page-open background work.
+func (a *App) warmWeiyunTickets(fileIDs []string) {
+	if len(fileIDs) == 0 {
+		return
+	}
+	c, err := a.weiyunClient()
+	if err != nil {
+		return
+	}
+	index := a.loadCloudIndex()
+	a.cloudMu.RLock()
+	locations := make(map[string]cloudLocation, len(fileIDs))
+	for _, fileID := range fileIDs {
+		if loc, ok := index.Locations[fileID]; ok && loc.PdirKey != "" {
+			locations[fileID] = loc
+		}
+	}
+	a.cloudMu.RUnlock()
+
+	items := make([]weiyun.DownloadItem, 0, len(locations))
+	for _, fileID := range fileIDs {
+		if _, ok := locations[fileID]; !ok {
+			continue
+		}
+		if a.cachedWeiyunTicket(fileID) != nil {
+			continue
+		}
+		items = append(items, weiyun.DownloadItem{FileID: fileID, PdirKey: locations[fileID].PdirKey})
+		if len(items) >= 50 {
+			break
+		}
+	}
+	if len(items) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	results, err := c.Download(ctx, items)
+	if err != nil {
+		logDebug("微云下载票据预热失败：%v", err)
+		return
+	}
+	now := time.Now()
+	a.weiyunTicketsMu.Lock()
+	for i, result := range results {
+		fileID := result.FileID
+		if fileID == "" && i < len(items) {
+			fileID = items[i].FileID
+		}
+		loc, ok := locations[fileID]
+		if !ok || result.HTTPSDownloadURL == "" {
+			continue
+		}
+		a.weiyunTickets[weiyunTicketID(fileID, loc.PdirKey)] = &weiyunTicket{
+			URL: result.HTTPSDownloadURL, Size: result.FileSize, Cookie: result.Cookie,
+			Name: loc.FileName, PdirKey: loc.PdirKey, FileID: fileID,
+			Expires: now.Add(weiyunTicketTTL),
+		}
+	}
+	a.weiyunTicketsMu.Unlock()
+	logDebug("微云下载票据已预热：%d 个", len(results))
 }
 
 func weiyunStatusError(w http.ResponseWriter, err error) {
@@ -406,10 +538,9 @@ func (a *App) serveWeiyunTicket(w http.ResponseWriter, r *http.Request, ticket *
 	up, err := (&http.Client{Timeout: 0}).Do(req)
 	if err == nil && (up.StatusCode == http.StatusForbidden || up.StatusCode == http.StatusNotFound) {
 		_ = up.Body.Close()
-		a.weiyunTicketsMu.Lock()
-		delete(a.weiyunTickets, weiyunTicketID(fileID, pdirKey))
-		a.weiyunTicketsMu.Unlock()
-		ticket, err = a.weiyunDownloadTicket(r.Context(), fileID, pdirKey)
+		name := ticket.Name
+		a.invalidateWeiyunTicket(fileID, pdirKey)
+		ticket, err = a.weiyunDownloadTicketNamed(r.Context(), fileID, pdirKey, name)
 		if err == nil {
 			req, err = http.NewRequestWithContext(r.Context(), r.Method, ticket.URL, nil)
 			if err == nil {
@@ -515,9 +646,7 @@ func (a *App) weiyunDownloadTicketNamed(ctx context.Context, fileID, pdirKey, na
 	// directory scan is needed just to find its name. This keeps repeat
 	// playback instant even when the location cache is cold.
 	if t := a.cachedWeiyunTicket(fileID); t != nil {
-		if name != "" {
-			t.Name = name
-		}
+		a.nameWeiyunTicket(t, name)
 
 		return t, nil
 	}
@@ -544,10 +673,25 @@ func (a *App) weiyunDownloadTicketNamed(ctx context.Context, fileID, pdirKey, na
 	if err != nil {
 		return nil, err
 	}
-	if name != "" {
-		t.Name = name
-	}
+	a.nameWeiyunTicket(t, name)
 	return t, nil
+}
+
+// nameWeiyunTicket keeps the cached ticket in sync with the caller-provided
+// file name. The ticket was historically stored before Name was attached, so a
+// later resolve could find a live ticket with an empty name and mark an
+// encrypted OGG/FLAC upload as application/octet-stream + unencrypted.
+func (a *App) nameWeiyunTicket(t *weiyunTicket, name string) {
+	name = strings.TrimSpace(name)
+	if t == nil || name == "" {
+		return
+	}
+	t.Name = name
+	a.weiyunTicketsMu.Lock()
+	if cached := a.weiyunTickets[weiyunTicketID(t.FileID, t.PdirKey)]; cached != nil {
+		cached.Name = name
+	}
+	a.weiyunTicketsMu.Unlock()
 }
 
 func (a *App) cachedWeiyunTicket(fileID string) *weiyunTicket {
@@ -563,6 +707,12 @@ func (a *App) cachedWeiyunTicket(fileID string) *weiyunTicket {
 	}
 
 	return nil
+}
+
+func (a *App) invalidateWeiyunTicket(fileID, pdirKey string) {
+	a.weiyunTicketsMu.Lock()
+	delete(a.weiyunTickets, weiyunTicketID(fileID, pdirKey))
+	a.weiyunTicketsMu.Unlock()
 }
 
 // handleWeiyunMusicFile resolves a QQ Music cloud row to a Weiyun file and
@@ -604,7 +754,7 @@ func (a *App) handleWeiyunStreamResolve(w http.ResponseWriter, r *http.Request, 
 		weiyunStatusError(w, err)
 		return
 	}
-	source := weiyunStreamSource{ticket: ticket, app: a, fileID: body.CloudFileID}
+	source := &weiyunStreamSource{ticket: ticket, app: a, fileID: body.CloudFileID}
 	// The download ticket already carries file_size. A second open here used to
 	// issue a full-file GET with no Range, so the resolve call downloaded the
 	// entire track before returning and the player appeared to hang. When the

@@ -174,6 +174,7 @@ func (c *musicCache) openLocked(lazy bool) (bool, error) {
 	path := filepath.Join(c.dir, cacheIndexName)
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
+		c.cleanupLocked()
 		if lazy {
 			return false, nil
 		}
@@ -208,7 +209,46 @@ func (c *musicCache) openLocked(lazy bool) (bool, error) {
 	}
 	c.idx = idx
 	c.seed = idx.Seed
+	c.cleanupLocked()
 	return true, nil
+}
+
+// cleanupLocked removes interrupted cache writes and data files that are no
+// longer referenced by the index. Without this, a failed cache store leaves a
+// multi-megabyte .tmp forever, and seed resets leave full tracks orphaned.
+func (c *musicCache) cleanupLocked() {
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return
+	}
+	valid := map[string]bool{cacheIndexName: true}
+	for _, item := range c.idx.Items {
+		valid[item.ID+cacheFileExt] = true
+	}
+	var freed int64
+	var removed int
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		drop := strings.HasSuffix(name, ".tmp")
+		if !drop && strings.HasSuffix(name, cacheFileExt) && !valid[name] {
+			drop = true
+		}
+		if !drop {
+			continue
+		}
+		if info, ierr := entry.Info(); ierr == nil {
+			freed += info.Size()
+		}
+		if os.Remove(filepath.Join(c.dir, name)) == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		logInfo("音乐缓存清理临时/孤立文件：%d 个，释放 %.1f MiB", removed, float64(freed)/(1<<20))
+	}
 }
 
 func (c *musicCache) saveLocked() error {

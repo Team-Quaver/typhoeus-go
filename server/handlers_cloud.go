@@ -579,6 +579,7 @@ func (a *App) handleCloudLibrary(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	items := make([]cloudItemView, 0, len(all))
+	fileIDs := make([]string, 0, len(all))
 	stats := cloudStats{Total: total, Scraped: 0}
 	for _, e := range all {
 		m := cloudDisplayMeta(e)
@@ -597,6 +598,9 @@ func (a *App) handleCloudLibrary(w http.ResponseWriter, r *http.Request) {
 			Song: e.Song, FileID: e.FileID,
 		}
 		items = append(items, item)
+		if item.FileID != "" {
+			fileIDs = append(fileIDs, item.FileID)
+		}
 		if item.Playable {
 			stats.Playable++
 		}
@@ -615,17 +619,33 @@ func (a *App) handleCloudLibrary(w http.ResponseWriter, r *http.Request) {
 	// discover pdir_key, which is what made the first click on a cloud song
 	// feel like an indefinite spinner. The scan is shared/deduplicated by
 	// weiyunFileIndex and a failure is intentionally ignored here.
-	go a.warmWeiyunLocations()
+	go a.warmWeiyunLibrary(fileIDs)
 	writeOK(w, cloudLibrarySnapshot{Items: items, Count: total, Stats: stats, Scrape: a.cloudScrapeSnapshot()})
 }
 
-func (a *App) warmWeiyunLocations() {
+func (a *App) warmWeiyunLibrary(fileIDs []string) {
+	a.warmWeiyunLocations(fileIDs)
+	a.warmWeiyunTickets(fileIDs)
+}
+
+func (a *App) warmWeiyunLocations(fileIDs []string) {
+	if len(fileIDs) == 0 {
+		return
+	}
 	index := a.loadCloudIndex()
-	// The location map is already populated: skip repeated full drive scans.
+	// Only skip the drive walk when every cloud row already has a location.
+	// A non-empty but stale map used to suppress warmup forever, making the
+	// first play of every newly-added/missing file pay for a full scan.
 	a.cloudMu.RLock()
-	locationCount := len(index.Locations)
+	missing := false
+	for _, fileID := range fileIDs {
+		if loc, ok := index.Locations[fileID]; !ok || loc.PdirKey == "" {
+			missing = true
+			break
+		}
+	}
 	a.cloudMu.RUnlock()
-	if locationCount > 0 {
+	if !missing {
 		return
 	}
 	if _, err := a.weiyunClient(); err != nil {
@@ -637,10 +657,7 @@ func (a *App) warmWeiyunLocations() {
 	if err != nil || idx == nil {
 		return
 	}
-	locations := make(map[string]cloudLocation, len(idx.Files))
-	for fileID, f := range idx.Files {
-		locations[fileID] = cloudLocation{PdirKey: f.PdirKey, FileName: f.FileName}
-	}
+	locations := weiyunLocationsOf(idx.Files)
 	a.rememberCloudLocations(locations)
 	if len(locations) > 0 {
 		logDebug("微云文件位置已预热：%d 个文件", len(idx.Files))

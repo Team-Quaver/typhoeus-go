@@ -199,6 +199,142 @@ func TestWeiyunStreamEntryUsesSongMid(t *testing.T) {
 	}
 }
 
+func TestWeiyunNamedTicketUpdatesCachedMetadata(t *testing.T) {
+	fileID, pdirKey, name := "file-name", "pdir-name", "大石碎胸口-万能青年旅店[aq].776176"
+	key := weiyunTicketID(fileID, pdirKey)
+	app := &App{
+		weiyunStore: &weiyunStore{},
+		weiyunTickets: map[string]*weiyunTicket{
+			key: {
+				URL: "https://example.invalid/audio", Size: 1,
+				PdirKey: pdirKey, FileID: fileID, Expires: time.Now().Add(time.Hour),
+			},
+		},
+	}
+
+	ticket, err := app.weiyunDownloadTicketNamed(context.Background(), fileID, "", name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ticket.Name != name {
+		t.Fatalf("returned name = %q", ticket.Name)
+	}
+	if cached := app.weiyunTickets[key]; cached == nil || cached.Name != name {
+		t.Fatalf("cached ticket metadata was not updated: %+v", cached)
+	}
+	if weiyunAudioMIME(app.weiyunTickets[key].Name) != "audio/wav" {
+		t.Fatal("cached file name must still drive Weiyun QMC MIME detection")
+	}
+}
+
+func TestWeiyunTicketInvalidateForcesFreshDownload(t *testing.T) {
+	fileID, pdirKey := "file-stale", "pdir-stale"
+	key := weiyunTicketID(fileID, pdirKey)
+	app := &App{
+		weiyunTickets: map[string]*weiyunTicket{
+			key: {FileID: fileID, PdirKey: pdirKey, Expires: time.Now().Add(time.Hour)},
+		},
+	}
+	app.invalidateWeiyunTicket(fileID, pdirKey)
+	if _, ok := app.weiyunTickets[key]; ok {
+		t.Fatal("stale CDN ticket must be removed before a forced refresh")
+	}
+}
+
+func TestWeiyunLocationsOfPersistsWholeScan(t *testing.T) {
+	locations := weiyunLocationsOf(map[string]weiyun.IndexedFile{
+		"file-1": {FileID: "file-1", FileName: "one[aq].776176", PdirKey: "pdir-1"},
+		"file-2": {FileID: "file-2", FileName: "two[aq].666c6163", PdirKey: "pdir-2"},
+	})
+	if len(locations) != 2 || locations["file-1"].PdirKey != "pdir-1" || locations["file-2"].FileName != "two[aq].666c6163" {
+		t.Fatalf("locations = %+v", locations)
+	}
+}
+
+func TestWeiyunStreamSourceRetriesExpiredCDNLink(t *testing.T) {
+	firstCalls, secondCalls := 0, 0
+	expired := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstCalls++
+		http.Error(w, "expired", http.StatusForbidden)
+	}))
+	defer expired.Close()
+	body := []byte("RIFF-fresh-audio")
+	fresh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalls++
+		if got := r.Header.Get("Range"); got != "bytes=0-15" {
+			t.Fatalf("range = %q", got)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(body)-1, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	defer fresh.Close()
+
+	source := &weiyunStreamSource{
+		ticket: &weiyunTicket{URL: expired.URL, Name: "song[aq].776176"},
+		refreshTest: func(_ context.Context, _ string, _ string, name string) (*weiyunTicket, error) {
+			if name != "song[aq].776176" {
+				t.Fatalf("refresh lost file name: %q", name)
+			}
+			return &weiyunTicket{URL: fresh.URL, Name: "song[aq].776176"}, nil
+		},
+	}
+	start, end := int64(0), int64(15)
+	resp, err := source.OpenRange(context.Background(), "ignored", &typhoeus.ByteRange{Start: &start, End: &end})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstCalls != 1 || secondCalls != 1 || resp.Status != http.StatusPartialContent || !bytes.Equal(got, body) {
+		t.Fatalf("retry = first:%d second:%d status:%d body:%q", firstCalls, secondCalls, resp.Status, got)
+	}
+}
+
+func TestWeiyunResolveQueryNameRestoresEncryptionMetadata(t *testing.T) {
+	fileID, pdirKey, name := "file-encrypted", "pdir-encrypted", "song[aq].776176"
+	app := &App{
+		streams:     map[string]*streamEntry{},
+		weiyunStore: &weiyunStore{},
+		weiyunTickets: map[string]*weiyunTicket{
+			weiyunTicketID(fileID, pdirKey): {
+				URL: "https://example.invalid/audio", Size: 1024,
+				PdirKey: pdirKey, FileID: fileID, Expires: time.Now().Add(time.Hour),
+			},
+		},
+		paceMap: map[string]*byteBucket{},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/stream/resolve?name="+name, nil)
+	app.handleWeiyunStreamResolve(rec, req, streamResolveBody{
+		Mid: "song-mid", Tier: "weiyun", DurationMs: 180000, CloudFileID: fileID,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data struct {
+			Path      string `json:"path"`
+			Mime      string `json:"mime"`
+			Encrypted bool   `json:"encrypted"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Data.Mime != "audio/wav" || !out.Data.Encrypted {
+		t.Fatalf("resolve metadata = mime %q encrypted %v", out.Data.Mime, out.Data.Encrypted)
+	}
+	token := strings.TrimPrefix(out.Data.Path, "/stream/")
+	if entry := app.streams[token]; entry == nil || !entry.encrypted || entry.mime != "audio/wav" {
+		t.Fatalf("stream entry = %+v", entry)
+	}
+}
+
 func TestValidateRangeResponseRejectsWrongStart(t *testing.T) {
 	up := &typhoeus.UpstreamResponse{
 		Status: http.StatusPartialContent, ContentRange: "bytes 100-199/1000",
