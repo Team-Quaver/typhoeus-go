@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/team-quaver/typhoeus-go/qmc"
+	"github.com/team-quaver/typhoeus-go/typhoeus"
 	"github.com/team-quaver/typhoeus-go/weiyun"
 )
 
@@ -35,7 +35,80 @@ type weiyunTicket struct {
 	Cookie  string
 	Name    string
 	PdirKey string
+	FileID  string
 	Expires time.Time
+}
+
+type weiyunStreamSource struct {
+	ticket *weiyunTicket
+	app    *App
+	fileID string
+}
+
+// weiyunCipher adapts the stateless QMCv1 transform to the generic stream
+// entry without exposing a public qmc.Cipher constructor.
+type weiyunCipher struct{}
+
+func (weiyunCipher) Decrypt(data []byte, offset int64) []byte {
+	out := append([]byte(nil), data...)
+	qmc.DecryptV1InPlace(out, offset)
+	return out
+}
+
+func (s weiyunStreamSource) Refresh(ctx context.Context) (streamOpener, error) {
+	// Avoid refreshing on every chunk; only react when the ticket is near expiry.
+	if time.Until(s.ticket.Expires) > time.Minute {
+		return s, nil
+	}
+	ticket, err := s.app.weiyunDownloadTicket(ctx, s.fileID, s.ticket.PdirKey)
+	if err != nil {
+		return s, err
+	}
+	ticket.Name = s.ticket.Name
+	return weiyunStreamSource{ticket: ticket, app: s.app, fileID: s.fileID}, nil
+}
+
+func (weiyunCipher) DecryptInPlace(data []byte, offset int64) {
+	qmc.DecryptV1InPlace(data, offset)
+}
+
+// Weiyun links can require a download cookie. This adapter lets the generic
+// stream proxy/cache path use the same Typhoeus opener without leaking that
+// cookie beyond the sidecar.
+func (s weiyunStreamSource) OpenRange(ctx context.Context, url string, rng *typhoeus.ByteRange) (*typhoeus.UpstreamResponse, error) {
+	t := s.ticket
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if t.Cookie != "" {
+		req.Header.Set("Cookie", t.Cookie)
+	}
+	if rng != nil && (rng.Start != nil || rng.End != nil) {
+		req.Header.Set("Range", rng.Header())
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := (&http.Client{Timeout: 0}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	cr := resp.Header.Get("Content-Range")
+	return &typhoeus.UpstreamResponse{
+		Status: resp.StatusCode, Header: resp.Header, ContentRange: cr,
+		Total: weiyunContentRangeTotal(cr), Body: resp.Body,
+	}, nil
+}
+
+func weiyunContentRangeTotal(contentRange string) int64 {
+	idx := strings.LastIndex(contentRange, "/")
+	if idx < 0 {
+		return 0
+	}
+	n, err := strconv.ParseInt(contentRange[idx+1:], 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 type weiyunIndexCache struct {
@@ -168,6 +241,9 @@ func (a *App) handleWeiyunAuthSet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, -1, "保存微云授权失败")
 		return
 	}
+	if a.session.Mode() == ModeExternal {
+		a.session.emitWeiyunAuth(body.Token, body.MCPURL)
+	}
 	a.invalidateWeiyunIndex()
 	c, err := a.weiyunClient()
 	if err != nil {
@@ -292,6 +368,9 @@ func (a *App) handleWeiyunAuthPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, -1, "保存微云授权失败")
 		return
 	}
+	if a.session.Mode() == ModeExternal {
+		a.session.emitWeiyunAuth(token, "")
+	}
 	a.invalidateWeiyunIndex()
 	a.weiyunAuthMu.Lock()
 	a.weiyunAuthFlow = nil
@@ -303,6 +382,9 @@ func (a *App) handleWeiyunAuthClear(w http.ResponseWriter, _ *http.Request) {
 	if err := a.weiyunStore.clear(); err != nil {
 		writeErr(w, 500, -1, "清除微云授权失败")
 		return
+	}
+	if a.session.Mode() == ModeExternal {
+		a.session.emitWeiyunAuth("", "")
 	}
 	a.invalidateWeiyunIndex()
 	writeOK(w, map[string]any{"configured": false})
@@ -347,7 +429,7 @@ func (a *App) serveWeiyunTicket(w http.ResponseWriter, r *http.Request, ticket *
 		return
 	}
 	defer up.Body.Close()
-	decrypt := r.URL.Query().Get("raw") != "1" && weiyunShouldDecrypt(ticket.Name)
+	decrypt := weiyunShouldDecrypt(ticket.Name)
 	contentType := up.Header.Get("Content-Type")
 	if decrypt {
 		contentType = weiyunAudioMIME(ticket.Name)
@@ -372,15 +454,10 @@ func (a *App) serveWeiyunTicket(w http.ResponseWriter, r *http.Request, ticket *
 	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Accept-Ranges", "bytes")
-	if r.URL.Query().Get("download") == "1" && ticket.Name != "" {
-		name := ticket.Name
-		if decrypt && strings.Contains(strings.ToLower(name), "[aq].") {
-			// The stored name encodes the container as hex ("6f6767" = "ogg").
-			// Present the decrypted stream under its real audio extension.
-			name = strings.TrimSuffix(name, filepath.Ext(name)) + weiyunAudioExt(name)
-		}
-		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
-	}
+	w.Header().Set("Cache-Control", "no-store")
+	// This endpoint is playback-only. An attachment disposition would turn the
+	// guarded relay into a browser download feature, so it is deliberately absent.
+	w.Header().Set("Content-Disposition", "inline")
 	for _, h := range []string{"Content-Length", "Content-Range"} {
 		if v := up.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
@@ -423,7 +500,7 @@ func (a *App) weiyunDownloadTicket(ctx context.Context, fileID, pdirKey string) 
 	item := res[0]
 	t = &weiyunTicket{
 		URL: item.HTTPSDownloadURL, Size: item.FileSize, Cookie: item.Cookie,
-		PdirKey: pdirKey,
+		PdirKey: pdirKey, FileID: fileID,
 		Expires: now.Add(weiyunTicketTTL),
 	}
 	a.weiyunTicketsMu.Lock()
@@ -434,6 +511,24 @@ func (a *App) weiyunDownloadTicket(ctx context.Context, fileID, pdirKey string) 
 }
 
 func (a *App) weiyunDownloadTicketNamed(ctx context.Context, fileID, pdirKey, name string) (*weiyunTicket, error) {
+	// A live ticket already contains the download URL, size and cookie; no
+	// directory scan is needed just to find its name. This keeps repeat
+	// playback instant even when the location cache is cold.
+	if t := a.cachedWeiyunTicket(fileID); t != nil {
+		if name != "" {
+			t.Name = name
+		}
+
+		return t, nil
+	}
+	if pdirKey == "" {
+		if loc, ok := a.cloudLocationOf(fileID); ok {
+			pdirKey = loc.PdirKey
+			if name == "" {
+				name = loc.FileName
+			}
+		}
+	}
 	if pdirKey == "" {
 		f, err := a.weiyunIndexedFile(ctx, fileID)
 		if err != nil {
@@ -441,6 +536,9 @@ func (a *App) weiyunDownloadTicketNamed(ctx context.Context, fileID, pdirKey, na
 		}
 		pdirKey = f.PdirKey
 		name = f.FileName
+		// The caller (resolve) is on the playback hot path; writing library.json
+		// synchronously here can add disk I/O before the first byte. The cloud
+		// page warms the whole location map in one batched write instead.
 	}
 	t, err := a.weiyunDownloadTicket(ctx, fileID, pdirKey)
 	if err != nil {
@@ -452,10 +550,32 @@ func (a *App) weiyunDownloadTicketNamed(ctx context.Context, fileID, pdirKey, na
 	return t, nil
 }
 
+func (a *App) cachedWeiyunTicket(fileID string) *weiyunTicket {
+	now := time.Now()
+	a.weiyunTicketsMu.Lock()
+	defer a.weiyunTicketsMu.Unlock()
+	for _, t := range a.weiyunTickets {
+		if t != nil && t.Expires.After(now) && t.FileID == fileID {
+			cp := *t
+
+			return &cp
+		}
+	}
+
+	return nil
+}
+
 // handleWeiyunMusicFile resolves a QQ Music cloud row to a Weiyun file and
 // streams it through the same QMC-decrypting relay. This is the music-only
 // bridge; it deliberately has no directory-management operations.
 func (a *App) handleWeiyunMusicFile(w http.ResponseWriter, r *http.Request) {
+	// StreamGuard parity with /stream and /cache/music/stream. Weiyun relay URLs
+	// are stable because they contain no short-lived ticket; without this gate a
+	// copied URL remains replayable for the ticket cache lifetime.
+	if cls := classifyStreamClient(r); cls == classBlocked {
+		writeErr(w, http.StatusForbidden, -1, "微云播放流仅允许应用内播放器取用")
+		return
+	}
 	fileID := r.PathValue("fileID")
 	if fileID == "" {
 		writeErr(w, 422, -1, "缺少 file_id")
@@ -468,6 +588,68 @@ func (a *App) handleWeiyunMusicFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.serveWeiyunTicket(w, r, ticket, fileID, ticket.PdirKey)
+}
+
+// handleWeiyunStreamResolve brings Weiyun playback into the same token/cache
+// pipeline as QQ streams. It keeps LocalGuard on and gives StreamGuard a token
+// URL instead of a stable file-id URL.
+func (a *App) handleWeiyunStreamResolve(w http.ResponseWriter, r *http.Request, body streamResolveBody) {
+	if strings.TrimSpace(body.CloudFileID) == "" {
+		writeErr(w, 422, -1, "缺少微云 file_id")
+		return
+	}
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	ticket, err := a.weiyunDownloadTicketNamed(r.Context(), body.CloudFileID, "", name)
+	if err != nil {
+		weiyunStatusError(w, err)
+		return
+	}
+	source := weiyunStreamSource{ticket: ticket, app: a, fileID: body.CloudFileID}
+	// The download ticket already carries file_size. A second open here used to
+	// issue a full-file GET with no Range, so the resolve call downloaded the
+	// entire track before returning and the player appeared to hang. When the
+	// ticket lacks a size, the first playback Range supplies Content-Range.
+	//
+	// The audio cache is also deliberately not started here: it would compete
+	// with the first player request for the same mid rate bucket and halve the
+	// playback bandwidth. It starts after the stream has actually delivered
+	// data (see noteStreamProgress / cacheStoreIfIdle).
+	a.purgeExpired()
+	token := newToken()
+	now := time.Now()
+	entry := &streamEntry{
+		mid:        body.Mid,
+		url:        ticket.URL,
+		mime:       weiyunAudioMIME(ticket.Name),
+		total:      ticket.Size,
+		filename:   ticket.Name,
+		tier:       "weiyun",
+		encrypted:  weiyunShouldDecrypt(ticket.Name),
+		cipher:     weiyunCipher{},
+		expiresAt:  now.Add(streamIdleTTL),
+		createdAt:  now,
+		degraded:   false,
+		requested:  "weiyun",
+		durationMs: body.DurationMs,
+		opener:     source,
+		cacheSeed:  body.CacheSeed,
+	}
+	a.streamMu.Lock()
+	a.streams[token] = entry
+	a.streamMu.Unlock()
+	a.paceBucket(entry.mid, paceRateFor(entry.total, body.DurationMs))
+	writeOK(w, map[string]any{
+		"token":          token,
+		"path":           "/stream/" + token,
+		"tier":           "weiyun",
+		"tier_label":     "微云文件",
+		"requested_tier": "weiyun",
+		"degraded":       false,
+		"mime":           entry.mime,
+		"size":           entry.total,
+		"filename":       entry.filename,
+		"encrypted":      entry.encrypted,
+	})
 }
 
 func weiyunTicketID(fileID, pdirKey string) string {
@@ -515,21 +697,6 @@ func weiyunAudioMIME(name string) string {
 		return "audio/wav"
 	default:
 		return "application/octet-stream"
-	}
-}
-
-func weiyunAudioExt(name string) string {
-	switch weiyunAudioMIME(name) {
-	case "audio/ogg":
-		return ".ogg"
-	case "audio/flac":
-		return ".flac"
-	case "audio/mpeg":
-		return ".mp3"
-	case "audio/wav":
-		return ".wav"
-	default:
-		return filepath.Ext(name)
 	}
 }
 

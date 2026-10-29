@@ -9,17 +9,19 @@ import (
 	"sync"
 )
 
-// weiyunAuth is deliberately stored separately from QQ Music's credential.enc:
-// it is a Weiyun MCP token, not a QQ Music login credential, and has a different
-// lifetime/revocation flow. The file is 0600 and only the sidecar reads it.
+// weiyunAuth is the Weiyun Skill API Key. In Electron mode it is owned by the
+// parent process and reaches the sidecar only through the encrypted handoff;
+// the in-process copy below is the sole representation. The legacy plaintext
+// migration is intentionally left to the parent process.
 type weiyunAuth struct {
 	Token  string `json:"token"`
 	MCPURL string `json:"mcp_url,omitempty"`
 }
 
 type weiyunStore struct {
-	mu   sync.RWMutex
-	auth *weiyunAuth
+	mu       sync.RWMutex
+	auth     *weiyunAuth
+	external bool
 }
 
 func weiyunAuthFile() string {
@@ -60,6 +62,13 @@ func (s *weiyunStore) save(token, mcpURL string) error {
 		mcpURL = "https://www.weiyun.com/api/v3/mcpserver"
 	}
 	a := &weiyunAuth{Token: token, MCPURL: mcpURL}
+	s.mu.Lock()
+	if s.external {
+		s.auth = a
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
 	if err := ensureCloudDirs(); err != nil {
 		return err
 	}
@@ -73,10 +82,30 @@ func (s *weiyunStore) save(token, mcpURL string) error {
 	return nil
 }
 
+// setExternal is called only while the sidecar bootstraps: the parent process is
+// the owner of the encrypted store, so the token stays in memory here.
+func (s *weiyunStore) setExternal(token, mcpURL string) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return
+	}
+	if strings.TrimSpace(mcpURL) == "" {
+		mcpURL = "https://www.weiyun.com/api/v3/mcpserver"
+	}
+	s.mu.Lock()
+	s.external = true
+	s.auth = &weiyunAuth{Token: token, MCPURL: mcpURL}
+	s.mu.Unlock()
+}
+
 func (s *weiyunStore) clear() error {
 	s.mu.Lock()
 	s.auth = nil
+	external := s.external
 	s.mu.Unlock()
+	if external {
+		return nil
+	}
 	err := os.Remove(weiyunAuthFile())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil

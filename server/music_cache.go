@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -394,6 +395,10 @@ func (a *App) cacheStore(entry *streamEntry, mid, frontendSeed string, durationM
 	}
 	ctr := cipher.NewCTR(block, cacheNonce("data:"+id, 0))
 	chunks := int((entry.total + cacheChunkSize - 1) / cacheChunkSize)
+	// The cache deliberately has no separate bucket. It shares the playback
+	// bucket, so cache traffic can never claim the 3x realtime allowance while
+	// playback is consuming 1x. Once playback is buffered, the remaining
+	// headroom fills the cache without causing stalls.
 	bucket := a.paceBucket(entry.mid, paceRateFor(entry.total, durationMs))
 	c.mu.Unlock()
 
@@ -411,29 +416,46 @@ func (a *App) cacheStore(entry *streamEntry, mid, frontendSeed string, durationM
 		}
 	}()
 	buf := make([]byte, cacheChunkSize)
-	for start := int64(0); start < entry.total; {
-		end := start + int64(len(buf)) - 1
-		if end >= entry.total {
-			end = entry.total - 1
+	// One sequential response covers the whole body. Issuing many adjacent
+	// Range requests raced the playback relay and could hand the cache a
+	// truncated segment; a single stream keeps the absolute QMC offset
+	// contiguous and avoids extra CDN round trips on track changes.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if refreshable, ok := entry.opener.(streamSourceRefresh); ok {
+		if next, rerr := refreshable.Refresh(ctx); rerr == nil {
+			entry.opener = next
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		up, err := typhoeus.OpenRange(ctx, entry.url, &typhoeus.ByteRange{Start: &start, End: &end})
-		if err != nil {
-			cancel()
-			return
-		}
-		n, copyErr := copyEncrypting(&pacedWriter{w: f, b: bucket, ctx: ctx}, up.Body, entry.cipher, ctr, buf, start)
-		closeErr := up.Body.Close()
-		cancel()
-		if copyErr != nil || closeErr != nil || n != end-start+1 {
-			return
-		}
-		start = end + 1
+	}
+	var up *typhoeus.UpstreamResponse
+	start, end := int64(0), entry.total-1
+	if entry.opener != nil {
+		up, err = entry.opener.OpenRange(ctx, entry.url, &typhoeus.ByteRange{Start: &start, End: &end})
+	} else {
+		up, err = typhoeus.OpenRange(ctx, entry.url, &typhoeus.ByteRange{Start: &start, End: &end})
+	}
+	if err != nil {
+		return
+	}
+	if err := validateRangeResponse(up, start); err != nil {
+		_ = up.Body.Close()
+		logWarn("音乐缓存回源 Range 异常，放弃本条缓存: %v", err)
+		return
+	}
+	n, copyErr := copyEncrypting(&pacedWriter{w: f, b: bucket, ctx: ctx}, up.Body, entry.cipher, ctr, buf, start)
+	closeErr := up.Body.Close()
+	if copyErr != nil || closeErr != nil || n != entry.total {
+		logWarn("音乐缓存回源中断（%d/%d 字节）: %v", n, entry.total, copyErr)
+		return
 	}
 	if err := f.Sync(); err != nil {
 		return
 	}
 	if err := f.Close(); err != nil {
+		return
+	}
+	if err := validateCachedAudio(tmp, key, id, entry.mime); err != nil {
+		logWarn("音乐缓存解密校验失败，丢弃本条: %v", err)
 		return
 	}
 	item := cacheEntry{
@@ -463,6 +485,85 @@ func (a *App) cacheStore(entry *streamEntry, mid, frontendSeed string, durationM
 		return
 	}
 	logInfo("音乐缓存已落盘：%s（%.1f MiB）", id, float64(item.Size)/(1<<20))
+}
+
+// cacheAfterPlayback starts the encrypted cache only once the playback relay
+// has successfully delivered bytes. It is safe to call on every Range request:
+// streamEntry.cacheStarted is guarded by streamMu and makes the start idempotent.
+func (a *App) cacheAfterPlayback(entry *streamEntry) {
+	if entry == nil || entry.cacheSeed == "" {
+		return
+	}
+	a.streamMu.Lock()
+	if entry.cacheStarted {
+		a.streamMu.Unlock()
+		return
+	}
+	entry.cacheStarted = true
+	seed, mid, duration := entry.cacheSeed, entry.mid, entry.durationMs
+	a.streamMu.Unlock()
+
+	go func() {
+		// Wait until no player request is reading this stream, then add a short
+		// grace period so a seek/restart request is not missed. The cache is a
+		// post-playback fill, not a second simultaneous reader competing for the
+		// same upstream connection and rate bucket.
+		for {
+			a.streamMu.Lock()
+			active := entry.activeRequests
+			a.streamMu.Unlock()
+
+			if active == 0 {
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		time.Sleep(1500 * time.Millisecond)
+
+		a.streamMu.Lock()
+		active := entry.activeRequests
+		a.streamMu.Unlock()
+		if active == 0 {
+			a.cacheStore(entry, mid, seed, duration)
+		}
+	}()
+}
+
+// validateCachedAudio decrypts the first bytes of a completed cache file and
+// checks for a recognizable audio container. A wrong QMC offset can still
+// produce a full-length file, so length alone is not a sufficient commit gate.
+func validateCachedAudio(path string, key []byte, entryID, mime string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	head := make([]byte, 16)
+	n, err := io.ReadFull(&cacheDecryptReader{r: f, key: key, entryID: entryID}, head)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return err
+	}
+	head = head[:n]
+	switch cachePlainMime(mime) {
+	case "audio/ogg":
+		if !bytes.HasPrefix(head, []byte("OggS")) {
+			return errors.New("缓存解密结果不是 Ogg 容器")
+		}
+	case "audio/flac":
+		if !bytes.HasPrefix(head, []byte("fLaC")) {
+			return errors.New("缓存解密结果不是 FLAC 容器")
+		}
+	case "audio/wav":
+		if !bytes.HasPrefix(head, []byte("RIFF")) {
+			return errors.New("缓存解密结果不是 WAV 容器")
+		}
+	case "audio/mpeg":
+		if !(bytes.HasPrefix(head, []byte{0xff, 0xfb}) || bytes.HasPrefix(head, []byte{0xff, 0xf3}) ||
+			bytes.HasPrefix(head, []byte{0xff, 0xf2}) || bytes.HasPrefix(head, []byte("ID3"))) {
+			return errors.New("缓存解密结果不是 MPEG 音频")
+		}
+	}
+	return nil
 }
 
 func copyEncrypting(dst io.Writer, src io.Reader, upstream qmc.Cipher, ctr cipher.Stream, buf []byte, start int64) (int64, error) {

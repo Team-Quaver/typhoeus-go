@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
@@ -74,6 +75,16 @@ type cloudMeta struct {
 type cloudIndex struct {
 	Version int                   `json:"version"`
 	Items   map[string]*cloudMeta `json:"items"`
+	// Locations caches file_id → {pdir_key, filename} after the first Weiyun
+	// directory scan.
+	// Playback uses this hot path instead of walking the whole drive on every
+	// track change; the cache is refreshed lazily when a lookup misses.
+	Locations map[string]cloudLocation `json:"locations,omitempty"`
+}
+
+type cloudLocation struct {
+	PdirKey  string `json:"pdir_key"`
+	FileName string `json:"filename,omitempty"`
 }
 
 type cloudEntry struct {
@@ -351,18 +362,89 @@ func (a *App) loadCloudIndex() *cloudIndex {
 	if a.cloudIndex != nil {
 		return a.cloudIndex
 	}
-	idx := &cloudIndex{Version: 1, Items: map[string]*cloudMeta{}}
+	idx := &cloudIndex{Version: 1, Items: map[string]*cloudMeta{}, Locations: map[string]cloudLocation{}}
 	if raw, err := os.ReadFile(cloudIndexFile()); err == nil {
 		var loaded cloudIndex
 		if json.Unmarshal(raw, &loaded) == nil && loaded.Items != nil {
 			if loaded.Version == 0 {
 				loaded.Version = 1
 			}
+			if loaded.Locations == nil {
+				loaded.Locations = map[string]cloudLocation{}
+			}
 			idx = &loaded
 		}
 	}
 	a.cloudIndex = idx
 	return idx
+}
+
+// cloudLocationOf returns a cached location for a Weiyun file. It never triggers
+// network I/O; a miss is the caller's signal to perform the full index scan.
+func (a *App) cloudLocationOf(fileID string) (cloudLocation, bool) {
+	if strings.TrimSpace(fileID) == "" {
+		return cloudLocation{}, false
+	}
+	idx := a.loadCloudIndex()
+	a.cloudMu.RLock()
+	defer a.cloudMu.RUnlock()
+	loc, ok := idx.Locations[fileID]
+	return loc, ok && loc.PdirKey != ""
+}
+
+// rememberCloudLocation persists one file_id → location pair. Saving the
+// index is best-effort: a failed write must not break playback.
+func (a *App) rememberCloudLocation(fileID string, loc cloudLocation) {
+	pdirKey := strings.TrimSpace(loc.PdirKey)
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" || pdirKey == "" {
+		return
+	}
+	loc.PdirKey, loc.FileName = pdirKey, strings.TrimSpace(loc.FileName)
+	idx := a.loadCloudIndex()
+	a.cloudMu.Lock()
+	if existing, ok := idx.Locations[fileID]; ok && existing == loc {
+		a.cloudMu.Unlock()
+		return
+	}
+	idx.Locations[fileID] = loc
+	err := a.saveCloudIndexLocked()
+	a.cloudMu.Unlock()
+	if err != nil {
+		logWarn("微云文件位置缓存写入失败: %v", err)
+	}
+}
+
+// rememberCloudLocations persists a whole warmed scan in one write. Per-file
+// saves would rewrite library.json thousands of times during a cold index.
+func (a *App) rememberCloudLocations(locations map[string]cloudLocation) {
+	if len(locations) == 0 {
+		return
+	}
+	idx := a.loadCloudIndex()
+	a.cloudMu.Lock()
+	changed := false
+	for fileID, loc := range locations {
+		fileID, loc.PdirKey, loc.FileName = strings.TrimSpace(fileID), strings.TrimSpace(loc.PdirKey), strings.TrimSpace(loc.FileName)
+		if fileID == "" || loc.PdirKey == "" {
+			continue
+		}
+		if old, ok := idx.Locations[fileID]; ok && old == loc {
+			continue
+		}
+		idx.Locations[fileID] = loc
+		changed = true
+	}
+	if !changed {
+		a.cloudMu.Unlock()
+
+		return
+	}
+	err := a.saveCloudIndexLocked()
+	a.cloudMu.Unlock()
+	if err != nil {
+		logWarn("微云文件位置批量缓存写入失败: %v", err)
+	}
 }
 
 func (a *App) saveCloudIndexLocked() error {
@@ -528,7 +610,41 @@ func (a *App) handleCloudLibrary(w http.ResponseWriter, r *http.Request) {
 			stats.WithLyric++
 		}
 	}
+	// Warm the Weiyun directory index after the library snapshot has been
+	// delivered. First playback otherwise pays for a full drive scan just to
+	// discover pdir_key, which is what made the first click on a cloud song
+	// feel like an indefinite spinner. The scan is shared/deduplicated by
+	// weiyunFileIndex and a failure is intentionally ignored here.
+	go a.warmWeiyunLocations()
 	writeOK(w, cloudLibrarySnapshot{Items: items, Count: total, Stats: stats, Scrape: a.cloudScrapeSnapshot()})
+}
+
+func (a *App) warmWeiyunLocations() {
+	index := a.loadCloudIndex()
+	// The location map is already populated: skip repeated full drive scans.
+	a.cloudMu.RLock()
+	locationCount := len(index.Locations)
+	a.cloudMu.RUnlock()
+	if locationCount > 0 {
+		return
+	}
+	if _, err := a.weiyunClient(); err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	idx, err := a.weiyunFileIndex(ctx)
+	if err != nil || idx == nil {
+		return
+	}
+	locations := make(map[string]cloudLocation, len(idx.Files))
+	for fileID, f := range idx.Files {
+		locations[fileID] = cloudLocation{PdirKey: f.PdirKey, FileName: f.FileName}
+	}
+	a.rememberCloudLocations(locations)
+	if len(locations) > 0 {
+		logDebug("微云文件位置已预热：%d 个文件", len(idx.Files))
+	}
 }
 
 func fileExists(dir, name string) bool {

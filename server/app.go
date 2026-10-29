@@ -96,11 +96,12 @@ func NewApp() (*App, error) {
 	resolver := typhoeus.NewStreamResolver(provider)
 	// 登录/登出后会员缓存立即失效
 	sess.OnCredentialChange(provider.InvalidateMembership)
+	weiyunStore := &weiyunStore{}
 	app := &App{
 		session:       sess,
 		provider:      provider,
 		resolver:      resolver,
-		weiyunStore:   &weiyunStore{},
+		weiyunStore:   weiyunStore,
 		weiyunTickets: map[string]*weiyunTicket{},
 		login:         modules.NewLoginModule(sess.Client()),
 		song:          modules.NewSongModule(sess.Client()),
@@ -121,6 +122,9 @@ func NewApp() (*App, error) {
 		paceMap:       map[string]*byteBucket{},
 		musicCache:    newMusicCache(),
 		cacheLimit:    &atomic.Int64{},
+	}
+	if auth := sess.takePendingWeiyunAuth(); auth != nil {
+		weiyunStore.setExternal(auth.Token, auth.MCPURL)
 	}
 	return app, nil
 }

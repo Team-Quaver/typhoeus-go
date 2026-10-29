@@ -60,7 +60,7 @@ func TestCloudPlaybackStateRoute(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("QUAVER_CONFIG_DIR", dir)
 	key := cloudKeyOf("10001", "file-playback")
-	app := &App{cloudIndex: &cloudIndex{Version: 1, Items: map[string]*cloudMeta{}}}
+	app := &App{cloudIndex: &cloudIndex{Version: 1, Items: map[string]*cloudMeta{}, Locations: map[string]cloudLocation{}}}
 
 	body := `{"key":"` + key + `","state":"blocked","error":"曲库拒绝 result=104003"}`
 	rec := httptest.NewRecorder()
@@ -85,9 +85,12 @@ func TestCloudMetaSetPreservesExistingFields(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("QUAVER_CONFIG_DIR", dir)
 	key := cloudKeyOf("10001", "file-meta")
-	app := &App{cloudIndex: &cloudIndex{Version: 1, Items: map[string]*cloudMeta{
-		key: {Key: key, Title: "Old", Artist: "Old Artist", Album: "Old Album"},
-	}}}
+	app := &App{cloudIndex: &cloudIndex{
+		Version: 1, Locations: map[string]cloudLocation{},
+		Items: map[string]*cloudMeta{
+			key: {Key: key, Title: "Old", Artist: "Old Artist", Album: "Old Album"},
+		},
+	}}
 
 	body := `{"key":"` + key + `","title":"New","artist":"","album":"New Album"}`
 	rec := httptest.NewRecorder()
@@ -99,6 +102,24 @@ func TestCloudMetaSetPreservesExistingFields(t *testing.T) {
 	meta := app.cloudIndex.Items[key]
 	if meta.Title != "New" || meta.Artist != "Old Artist" || meta.Album != "New Album" || !meta.EditedMeta {
 		t.Fatalf("meta update = %+v", meta)
+	}
+}
+
+func TestCloudLocationCacheRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("QUAVER_CONFIG_DIR", dir)
+	app := &App{cloudIndex: &cloudIndex{
+		Version: 1, Items: map[string]*cloudMeta{}, Locations: map[string]cloudLocation{},
+	}}
+
+	app.rememberCloudLocation("file-location", cloudLocation{PdirKey: "pdir-location", FileName: "song[aq].6f6767"})
+	if got, ok := app.cloudLocationOf("file-location"); !ok || got.PdirKey != "pdir-location" || got.FileName != "song[aq].6f6767" {
+		t.Fatalf("location cache = %+v, %v", got, ok)
+	}
+
+	reloaded := &App{}
+	if got, ok := reloaded.cloudLocationOf("file-location"); !ok || got.PdirKey != "pdir-location" || got.FileName != "song[aq].6f6767" {
+		t.Fatalf("persisted location cache = %+v, %v", got, ok)
 	}
 }
 
@@ -208,9 +229,12 @@ func TestCloudResourceRoutes(t *testing.T) {
 	jpeg := []byte{0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4}
 	lyric := "[00:01.00]导入歌词\n"
 	app := &App{
-		cloudIndex: &cloudIndex{Version: 1, Items: map[string]*cloudMeta{
-			key: {Key: key, LyricImport: true, ImportFormat: "lrc", CoverManual: true},
-		}},
+		cloudIndex: &cloudIndex{
+			Version: 1, Locations: map[string]cloudLocation{},
+			Items: map[string]*cloudMeta{
+				key: {Key: key, LyricImport: true, ImportFormat: "lrc", CoverManual: true},
+			},
+		},
 	}
 	if err := ensureCloudDirs(); err != nil {
 		t.Fatal(err)
