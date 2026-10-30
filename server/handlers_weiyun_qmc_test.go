@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,6 +131,124 @@ func TestWeiyunStreamResumeKeepsDecryptOffset(t *testing.T) {
 		t.Fatalf("expected one resume request, got %d calls", opener.calls)
 	}
 }
+
+func TestWeiyunParallelRangePreservesOrderAndDecrypts(t *testing.T) {
+	plain := bytes.Repeat([]byte("parallel-range-order-"), 100_000) // 2.1 MiB
+	cipherText := append([]byte(nil), plain...)
+	qmc.DecryptV1InPlace(cipherText, 0)
+
+	var mu sync.Mutex
+	var ranges []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		start, end := int64(0), int64(len(cipherText)-1)
+		if spec, ok := strings.CutPrefix(rangeHeader, "bytes="); ok {
+			left, right, found := strings.Cut(spec, "-")
+			if !found {
+				t.Fatalf("invalid range %q", rangeHeader)
+			}
+			var err error
+			start, err = strconv.ParseInt(left, 10, 64)
+			if err != nil {
+				t.Fatalf("range start: %v", err)
+			}
+			if right != "" {
+				end, err = strconv.ParseInt(right, 10, 64)
+				if err != nil {
+					t.Fatalf("range end: %v", err)
+				}
+			}
+		}
+		if start < 0 || end < start || end >= int64(len(cipherText)) {
+			t.Fatalf("bad range %s", rangeHeader)
+		}
+		mu.Lock()
+		ranges = append(ranges, rangeHeader)
+		mu.Unlock()
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(cipherText)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(cipherText[start : end+1])
+	}))
+	defer srv.Close()
+
+	oldClient := weiyunCDNClient
+	weiyunCDNClient = srv.Client()
+	defer func() { weiyunCDNClient = oldClient }()
+
+	ticket := &weiyunTicket{URL: srv.URL, Size: int64(len(cipherText))}
+	up, err := openWeiyunTicketRange(context.Background(), ticket,
+		&typhoeus.ByteRange{Start: ptrInt64(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer up.Body.Close()
+
+	var got bytes.Buffer
+	if _, err := typhoeus.CopyRange(context.Background(), &got, srv.URL, up,
+		weiyunCipher{}, 0, int64(len(cipherText))-1, true, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Bytes(), plain) {
+		t.Fatalf("parallel body order/decrypt mismatch: got %d bytes", got.Len())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ranges) < 2 {
+		t.Fatalf("expected multiple upstream ranges, got %v", ranges)
+	}
+}
+
+func TestWeiyunParallelRangeCancelsPrefetchedChunks(t *testing.T) {
+	plain := bytes.Repeat([]byte("parallel-cancel-"), 64_000)
+	cipherText := append([]byte(nil), plain...)
+	qmc.DecryptV1InPlace(cipherText, 0)
+
+	var mu sync.Mutex
+	requests := map[int64]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := int64(0)
+		end := int64(len(cipherText) - 1)
+		if spec, ok := strings.CutPrefix(r.Header.Get("Range"), "bytes="); ok {
+			left, right, _ := strings.Cut(spec, "-")
+			start, _ = strconv.ParseInt(left, 10, 64)
+			if right != "" {
+				end, _ = strconv.ParseInt(right, 10, 64)
+			}
+		}
+		mu.Lock()
+		requests[start] = true
+		mu.Unlock()
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(cipherText)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(cipherText[start : end+1])
+	}))
+	defer srv.Close()
+
+	oldClient := weiyunCDNClient
+	weiyunCDNClient = srv.Client()
+	defer func() { weiyunCDNClient = oldClient }()
+
+	ticket := &weiyunTicket{URL: srv.URL, Size: int64(len(cipherText))}
+	up, err := openWeiyunTicketRange(context.Background(), ticket,
+		&typhoeus.ByteRange{Start: ptrInt64(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := up.Body.(*weiyunParallelBody)
+	if _, err := body.Read(make([]byte, 256<<10)); err != nil {
+		t.Fatal(err)
+	}
+	_ = body.Close()
+	_ = up.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if requests[0] != true {
+		t.Fatal("first chunk should have been requested")
+	}
+}
+
+func ptrInt64(v int64) *int64 { return &v }
 
 func TestWeiyunStreamEntryUsesSongMid(t *testing.T) {
 	body := []byte("plain audio")

@@ -28,6 +28,14 @@ const (
 	weiyunAuthCodeTTL  = 5 * time.Minute
 	weiyunAPIBase      = "https://www.weiyun.com"
 	weiyunAuthCodePath = "/api/v3/mcp/token/code"
+
+	// 微云 CDN 对单条 HTTPS 连接大约只给 256KiB/s。24bit/48kHz 立体声 WAV
+	// 本身就要约 288KB/s，单连接回源必然低于实时码率，表现为「播一段、卡一下」。
+	// 多连接分段回源把吞吐拉回实时以上；分段仍按原始字节序拼接，QMC 解密偏移
+	// 保持不变。256KiB 的分段让首段尽快到齐，后续分段在后台并行预取。
+	weiyunParallelChunk    = 256 << 10
+	weiyunParallelConns    = 6
+	weiyunParallelMinBytes = 512 << 10
 )
 
 type weiyunTicket struct {
@@ -46,6 +54,21 @@ type weiyunStreamSource struct {
 	app         *App
 	fileID      string
 	refreshTest func(context.Context, string, string, string) (*weiyunTicket, error)
+}
+
+var weiyunCDNClient = newWeiyunCDNClient()
+
+func newWeiyunCDNClient() *http.Client {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Client{Timeout: 0}
+	}
+	clone := transport.Clone()
+	clone.MaxIdleConns = 32
+	clone.MaxIdleConnsPerHost = weiyunParallelConns + 2
+	clone.IdleConnTimeout = 90 * time.Second
+
+	return &http.Client{Timeout: 0, Transport: clone}
 }
 
 // weiyunCipher adapts the stateless QMCv1 transform to the generic stream
@@ -129,18 +152,83 @@ func (s *weiyunStreamSource) open(ctx context.Context, rng *typhoeus.ByteRange) 
 	if t == nil {
 		return nil, errors.New("微云下载票据缺失")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.URL, nil)
+
+	return openWeiyunTicketRange(ctx, t, rng)
+}
+
+func openWeiyunTicketRange(ctx context.Context, ticket *weiyunTicket, rng *typhoeus.ByteRange) (*typhoeus.UpstreamResponse, error) {
+	if !weiyunParallelEligible(rng) {
+		return openWeiyunTicketSingle(ctx, ticket, rng)
+	}
+
+	firstStart := *rng.Start
+	firstEnd := firstStart + weiyunParallelChunk - 1
+	if rng.End != nil && firstEnd > *rng.End {
+		firstEnd = *rng.End
+	}
+	firstRange := &typhoeus.ByteRange{Start: &firstStart, End: &firstEnd}
+	first, err := openWeiyunTicketSingle(ctx, ticket, firstRange)
+	if err != nil || first.Status != http.StatusPartialContent {
+		return first, err
+	}
+	if got := rangeContentStart(first.ContentRange); got >= 0 && got != firstStart {
+		_ = first.Body.Close()
+		return nil, fmt.Errorf("微云回源起点不符：期望 %d，上游给 %d", firstStart, got)
+	}
+	total := weiyunContentRangeTotal(first.ContentRange)
+	if total <= 0 {
+		return first, nil
+	}
+	last := total - 1
+	if rng.End != nil && *rng.End < last {
+		last = *rng.End
+	}
+	if last-firstStart+1 < weiyunParallelMinBytes || firstEnd >= last {
+		return first, nil
+	}
+
+	body := newWeiyunParallelBody(ctx, ticket, first, firstStart, last, total)
+	header := first.Header.Clone()
+	header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", firstStart, last, total))
+	header.Set("Content-Length", strconv.FormatInt(last-firstStart+1, 10))
+	header.Del("Transfer-Encoding")
+
+	return &typhoeus.UpstreamResponse{
+		Status:       http.StatusPartialContent,
+		Header:       header,
+		ContentRange: header.Get("Content-Range"),
+		Total:        total,
+		Body:         body,
+	}, nil
+}
+
+func weiyunParallelEligible(rng *typhoeus.ByteRange) bool {
+	if rng == nil || rng.Start == nil || *rng.Start < 0 {
+		return false
+	}
+	if rng.End != nil && *rng.End >= *rng.Start && *rng.End-*rng.Start+1 < weiyunParallelMinBytes {
+		return false
+	}
+
+	return true
+}
+
+func openWeiyunTicketSingle(ctx context.Context, ticket *weiyunTicket, rng *typhoeus.ByteRange) (*typhoeus.UpstreamResponse, error) {
+	if ticket == nil {
+		return nil, errors.New("微云下载票据缺失")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ticket.URL, nil)
 	if err != nil {
 		return nil, err
 	}
-	if t.Cookie != "" {
-		req.Header.Set("Cookie", t.Cookie)
+	if ticket.Cookie != "" {
+		req.Header.Set("Cookie", ticket.Cookie)
 	}
 	if rng != nil && (rng.Start != nil || rng.End != nil) {
 		req.Header.Set("Range", rng.Header())
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
-	resp, err := (&http.Client{Timeout: 0}).Do(req)
+	resp, err := weiyunCDNClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -149,6 +237,195 @@ func (s *weiyunStreamSource) open(ctx context.Context, rng *typhoeus.ByteRange) 
 		Status: resp.StatusCode, Header: resp.Header, ContentRange: cr,
 		Total: weiyunContentRangeTotal(cr), Body: resp.Body,
 	}, nil
+}
+
+type weiyunChunkResult struct {
+	data []byte
+	err  error
+}
+
+// weiyunParallelBody 把一段大 Range 拆成固定大小的子 Range 并行回源，再按
+// 原始字节序串行交给播放器/缓存。首段保持流式，不等整段下载完，所以起播
+// 延迟仍然只取决于首段；后续段由 worker 预取，播放器不会追着单连接跑。
+type weiyunParallelBody struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	ticket  *weiyunTicket
+	start   int64
+	end     int64
+	total   int64
+	chunks  int
+	first   io.ReadCloser
+	readIdx int
+	nextIdx int
+	current []byte
+	results map[int]*weiyunChunkResult
+	mu      sync.Mutex
+	cond    *sync.Cond
+	closed  bool
+}
+
+func newWeiyunParallelBody(parent context.Context, ticket *weiyunTicket, first *typhoeus.UpstreamResponse,
+	start, end, total int64) *weiyunParallelBody {
+	ctx, cancel := context.WithCancel(parent)
+	span := end - start + 1
+	chunks := int((span + weiyunParallelChunk - 1) / weiyunParallelChunk)
+	b := &weiyunParallelBody{
+		ctx: ctx, cancel: cancel, ticket: ticket, start: start, end: end, total: total,
+		chunks: chunks, first: first.Body, readIdx: 0, nextIdx: 1,
+		results: map[int]*weiyunChunkResult{},
+	}
+	b.cond = sync.NewCond(&b.mu)
+	for i := 0; i < weiyunParallelConns; i++ {
+		go b.worker()
+	}
+
+	return b
+}
+
+func (b *weiyunParallelBody) worker() {
+	for {
+		b.mu.Lock()
+		for !b.closed && (b.nextIdx >= b.chunks || b.nextIdx >= b.readIdx+weiyunParallelConns) {
+			b.cond.Wait()
+		}
+		if b.closed {
+			b.mu.Unlock()
+			return
+		}
+		idx := b.nextIdx
+		b.nextIdx++
+		b.mu.Unlock()
+
+		result := b.fetch(idx)
+
+		b.mu.Lock()
+		if !b.closed {
+			b.results[idx] = result
+			b.cond.Broadcast()
+		}
+		b.mu.Unlock()
+	}
+}
+
+func (b *weiyunParallelBody) fetch(idx int) *weiyunChunkResult {
+	start := b.start + int64(idx)*weiyunParallelChunk
+	end := start + weiyunParallelChunk - 1
+	if end > b.end {
+		end = b.end
+	}
+	up, err := openWeiyunTicketSingle(b.ctx, b.ticket, &typhoeus.ByteRange{Start: &start, End: &end})
+	if err != nil {
+		return &weiyunChunkResult{err: err}
+	}
+	defer up.Body.Close()
+	if up.Status != http.StatusPartialContent {
+		return &weiyunChunkResult{err: fmt.Errorf("微云分段回源 HTTP %d", up.Status)}
+	}
+	if got := rangeContentStart(up.ContentRange); got >= 0 && got != start {
+		return &weiyunChunkResult{err: fmt.Errorf("微云分段回源起点不符：期望 %d，上游给 %d", start, got)}
+	}
+	want := end - start + 1
+	data, err := io.ReadAll(io.LimitReader(up.Body, want))
+	if err != nil {
+		return &weiyunChunkResult{err: err}
+	}
+	if int64(len(data)) != want {
+		return &weiyunChunkResult{err: fmt.Errorf("微云分段回源提前结束（%d/%d 字节）", len(data), want)}
+	}
+
+	return &weiyunChunkResult{data: data}
+}
+
+func (b *weiyunParallelBody) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	for {
+		b.mu.Lock()
+		if b.closed {
+			b.mu.Unlock()
+			return 0, io.ErrClosedPipe
+		}
+		first := b.first
+		b.mu.Unlock()
+		if first == nil {
+			break
+		}
+		n, err := first.Read(p)
+		if n > 0 {
+			return n, nil
+		}
+		if err == io.EOF {
+			b.mu.Lock()
+			if b.first == first {
+				b.first = nil
+				_ = first.Close()
+				b.readIdx = 1
+				b.cond.Broadcast()
+			}
+			b.mu.Unlock()
+			return b.Read(p)
+		}
+		if err != nil {
+			_ = b.Close()
+			return 0, err
+		}
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for {
+		if b.closed {
+			return 0, io.ErrClosedPipe
+		}
+		if len(b.current) > 0 {
+			n := copy(p, b.current)
+			b.current = b.current[n:]
+			if len(b.current) == 0 {
+				b.current = nil
+				b.readIdx++
+				b.cond.Broadcast()
+			}
+			return n, nil
+		}
+		if b.readIdx >= b.chunks {
+			return 0, io.EOF
+		}
+		if result, ok := b.results[b.readIdx]; ok {
+			delete(b.results, b.readIdx)
+			if result.err != nil {
+				b.closed = true
+				b.cancel()
+				b.cond.Broadcast()
+				return 0, result.err
+			}
+			b.current = result.data
+			continue
+		}
+		b.cond.Broadcast()
+		b.cond.Wait()
+	}
+}
+
+func (b *weiyunParallelBody) Close() error {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return nil
+	}
+	b.closed = true
+	first := b.first
+	b.first = nil
+	b.cancel()
+	b.cond.Broadcast()
+	b.mu.Unlock()
+	if first != nil {
+		return first.Close()
+	}
+
+	return nil
 }
 
 func weiyunContentRangeTotal(contentRange string) int64 {
@@ -523,36 +800,20 @@ func (a *App) handleWeiyunAuthClear(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *App) serveWeiyunTicket(w http.ResponseWriter, r *http.Request, ticket *weiyunTicket, fileID, pdirKey string) {
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, ticket.URL, nil)
-	if err != nil {
-		writeErr(w, 502, -1, "下载链接无效")
+	rangeHeader := strings.TrimSpace(r.Header.Get("Range"))
+	rng := typhoeus.ParseRange(rangeHeader)
+	if rangeHeader != "" && (rng == nil || (rng.Start != nil && *rng.Start < 0)) {
+		writeErr(w, http.StatusRequestedRangeNotSatisfiable, -1, "微云音频 Range 无效")
 		return
 	}
-	if ticket.Cookie != "" {
-		req.Header.Set("Cookie", ticket.Cookie)
-	}
-	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
-		req.Header.Set("Range", rangeHeader)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-	up, err := (&http.Client{Timeout: 0}).Do(req)
-	if err == nil && (up.StatusCode == http.StatusForbidden || up.StatusCode == http.StatusNotFound) {
+	up, err := openWeiyunTicketRange(r.Context(), ticket, rng)
+	if err == nil && (up.Status == http.StatusForbidden || up.Status == http.StatusNotFound) {
 		_ = up.Body.Close()
 		name := ticket.Name
 		a.invalidateWeiyunTicket(fileID, pdirKey)
 		ticket, err = a.weiyunDownloadTicketNamed(r.Context(), fileID, pdirKey, name)
 		if err == nil {
-			req, err = http.NewRequestWithContext(r.Context(), r.Method, ticket.URL, nil)
-			if err == nil {
-				if ticket.Cookie != "" {
-					req.Header.Set("Cookie", ticket.Cookie)
-				}
-				if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
-					req.Header.Set("Range", rangeHeader)
-				}
-				req.Header.Set("User-Agent", "Mozilla/5.0")
-				up, err = (&http.Client{Timeout: 0}).Do(req)
-			}
+			up, err = openWeiyunTicketRange(r.Context(), ticket, rng)
 		}
 	}
 	if err != nil {
@@ -594,7 +855,7 @@ func (a *App) serveWeiyunTicket(w http.ResponseWriter, r *http.Request, ticket *
 			w.Header().Set(h, v)
 		}
 	}
-	w.WriteHeader(up.StatusCode)
+	w.WriteHeader(up.Status)
 	// Weiyun's music upload pipeline returns QMCv1-encrypted audio. Playback and
 	// downloads go through this same endpoint, so decrypt transparently by the
 	// absolute byte offset. Range seeks remain valid because QMCv1 is stateless.
