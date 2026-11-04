@@ -170,6 +170,10 @@ func (c *musicCache) openLocked(lazy bool) (bool, error) {
 	if err := os.MkdirAll(c.dir, 0o700); err != nil {
 		return false, fmt.Errorf("创建缓存目录失败: %w", err)
 	}
+	// 上次进程在写缓存中途退出会留下 .*.tmp 残片（cacheStore 的清理
+	// defer 只在正常返回时执行）。这些文件不在索引里，用户「清理缓存」
+	// 后仍白占磁盘，所以进程内第一次打开缓存时先扫掉。
+	c.removeTempsLocked()
 	path := filepath.Join(c.dir, cacheIndexName)
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -296,13 +300,34 @@ func (a *App) cacheSetSeed(seed string) error {
 }
 
 func (c *musicCache) resetLocked(reason string) error {
-	for _, e := range c.idx.Items {
-		_ = os.Remove(c.fileOf(e))
-	}
-	_ = os.Remove(filepath.Join(c.dir, cacheIndexName))
+	// 按目录内容清，而不是只清索引里的条目：写盘中途退出留下的 .tmp、
+	// 以及索引损坏后来不及登记的孤儿分片都占磁盘，用户点「清理缓存」
+	// 必须真的归零。目录里只有本缓存的 index / 分片 / 临时文件。
+	c.removeFilesLocked(func(name string) bool {
+		return strings.HasSuffix(name, cacheFileExt) || strings.HasSuffix(name, ".tmp")
+	})
 	c.idx = cacheIndex{Format: cacheFormat, Seed: c.seed, Items: []cacheEntry{}}
 	logInfo("音乐缓存已重置：%s", reason)
 	return nil
+}
+
+// removeTempsLocked 清理未提交的临时文件（cacheStore 中断残留）。
+func (c *musicCache) removeTempsLocked() {
+	c.removeFilesLocked(func(name string) bool { return strings.HasSuffix(name, ".tmp") })
+}
+
+// removeFilesLocked 删除 dir 下满足条件的普通文件；目录不可读时静默跳过。
+func (c *musicCache) removeFilesLocked(match func(name string) bool) {
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !match(entry.Name()) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(c.dir, entry.Name()))
+	}
 }
 
 func (c *musicCache) fileOf(e cacheEntry) string {
