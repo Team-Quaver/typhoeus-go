@@ -5,6 +5,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -41,5 +43,36 @@ func TestCacheDecryptReaderSeeks(t *testing.T) {
 	app.musicCache.readers["tok"] = &cacheReader{expires: time.Now().Add(time.Minute)}
 	if app.cacheResolvePlayback("tok") == nil {
 		t.Fatal("live token rejected")
+	}
+}
+
+func TestValidateCachedAudioRejectsWrongPlaintext(t *testing.T) {
+	seed := "0123456789abcdef0123456789abcdef"
+	entryID := randomTag()
+	key := cacheKey(seed, seed, "data:"+entryID)
+	if key == nil {
+		t.Fatal("nil key")
+	}
+
+	write := func(name string, plain []byte) string {
+		path := filepath.Join(t.TempDir(), name)
+		block, _ := aes.NewCipher(key)
+		ctr := cipher.NewCTR(block, cacheNonce("data:"+entryID, 0))
+		enc := append([]byte(nil), plain...)
+		ctr.XORKeyStream(enc, enc)
+		if err := os.WriteFile(path, enc, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	good := write("good.ogg", append([]byte("OggS"), bytes.Repeat([]byte{1}, 64)...))
+	if err := validateCachedAudio(good, key, entryID, "audio/ogg"); err != nil {
+		t.Fatalf("valid Ogg rejected: %v", err)
+	}
+
+	bad := write("bad.ogg", bytes.Repeat([]byte{0x7f}, 80))
+	if err := validateCachedAudio(bad, key, entryID, "audio/ogg"); err == nil {
+		t.Fatal("noise masquerading as Ogg was accepted")
 	}
 }

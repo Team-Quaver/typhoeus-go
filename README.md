@@ -60,8 +60,10 @@ QUAVER_PORT=3200 ./typhoeus-go        # 默认 http://127.0.0.1:3200
 | POST/DELETE | `/cloud/lyric/import` · `/cloud/lyric/import/{key}` | 导入 / 撤销自定义歌词 |
 | POST | `/cloud/cover/import` | 导入自定义封面 |
 | GET  | `/cloud/lyric/{key}` `/cloud/cover/{key}` | 云盘歌词 / 封面资源 |
+| GET/POST/DELETE | `/weiyun/status` · `/weiyun/auth*` | 微云 Skill API Key 状态 / 授权、轮询、撤销 |
+| GET  | `/weiyun/music/{file_id}` | 微云兜底中继；正常播放走 `/stream/resolve` |
 | GET  | `/stream/tiers` | 会员等级 + 可播/全量档位表（含 `encrypted` 标记） |
-| POST | `/stream/resolve` | `{mid, media_mid?, tier, auto?, deprioritize?}` → 换取中继 token |
+| POST | `/stream/resolve` | `{mid, media_mid?, tier, auto?, deprioritize?, cloud_file_id?, cache_seed?}` → 换取中继 token |
 | GET  | `/stream/{token}` | Range 透传中继（`<audio>` 的 src 指这里） |
 | POST | `/song/urls` | 批量取链（file_type 序号表见 `server/handlers_content.go`） |
 | GET  | `/song/{id\|mid}/detail` `/song/{v}/url` `/song/{v}/lyric` `/song/{id}/comments` | 歌曲域 |

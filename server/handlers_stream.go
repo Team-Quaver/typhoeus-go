@@ -9,10 +9,14 @@ package server
 // 「解密后整文件」的内存峰值。除 cache/music/*.quaverlocalcache 的本地加密缓存外，
 // 播放链路没有任何明文磁盘写入。
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/team-quaver/typhoeus-go/qmc"
@@ -37,6 +41,25 @@ type streamEntry struct {
 	requested  string
 	durationMs int64 // 客户端声明的曲长（限速推算用；0=未知）
 	probeBytes int64 // fetch 探测类请求已发放的额度（分类见 stream_guard.go）
+	// opener 非空时由微云下载链接提供；否则使用 Typhoeus 的 CDN opener。
+	opener streamOpener
+	// cacheSeed starts the encrypted music cache only after playback has
+	// delivered bytes. Starting it in resolve would open a second full-file
+	// request while the player is still buffering the first one.
+	cacheSeed    string
+	cacheStarted bool
+	// activeRequests counts in-flight playback reads. The background cache waits
+	// for this to reach zero before opening its own full-file response.
+	activeRequests int
+}
+
+type streamOpener interface {
+	OpenRange(ctx context.Context, url string, rng *typhoeus.ByteRange) (*typhoeus.UpstreamResponse, error)
+}
+
+// streamSourceRefresh lets ticket-bearing sources refresh before cache writes.
+type streamSourceRefresh interface {
+	Refresh(ctx context.Context) (streamOpener, error)
 }
 
 const (
@@ -122,12 +145,13 @@ type streamResolveBody struct {
 	Mid          string   `json:"mid"`
 	MediaMid     string   `json:"media_mid"`
 	SongType     int      `json:"song_type"`
-	Tier         string   `json:"tier"`         // typhoeus 档位 id
-	Auto         bool     `json:"auto"`         // true=自动音质模式（会员不足向下降档，不报 403）
-	Deprioritize []string `json:"deprioritize"` // 回退链降权档位（UI「回退排序」开关）
-	Platform     string   `json:"platform"`     // 取链平台身份：android(缺省)/web/desktop——严格曲库的版权判定与此相关
-	DurationMs   int64    `json:"duration_ms"`  // 曲长提示（秒×1000）：中继限速的实时倍率据此推算；缺省按整曲 ≥2 分钟兜底
-	CacheSeed    string   `json:"cache_seed"`   // 前端缓存密钥半种；空 = 本次播放不参与磁盘缓存
+	Tier         string   `json:"tier"`          // typhoeus 档位 id
+	Auto         bool     `json:"auto"`          // true=自动音质模式（会员不足向下降档，不报 403）
+	Deprioritize []string `json:"deprioritize"`  // 回退链降权档位（UI「回退排序」开关）
+	Platform     string   `json:"platform"`      // 取链平台身份：android(缺省)/web/desktop——严格曲库的版权判定与此相关
+	DurationMs   int64    `json:"duration_ms"`   // 曲长提示（秒×1000）：中继限速的实时倍率据此推算；缺省按整曲 ≥2 分钟兜底
+	CacheSeed    string   `json:"cache_seed"`    // 前端缓存密钥半种；空 = 本次播放不参与磁盘缓存
+	CloudFileID  string   `json:"cloud_file_id"` // 微云条目：网盘播放也走同一条缓存/令牌链路
 }
 
 func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +165,27 @@ func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Tier == "" {
 		body.Tier = "128"
+	}
+	if body.CloudFileID != "" {
+		if body.CacheSeed != "" {
+			if err := a.cacheSetSeed(body.CacheSeed); err == nil {
+				if tok, item, cerr := a.cacheTryResolve(body.Mid, body.CacheSeed, "weiyun"); cerr == nil && item != nil {
+					writeOK(w, map[string]any{
+						"token":      tok,
+						"path":       "/cache/music/stream/" + tok,
+						"tier":       item.Tier,
+						"tier_label": tierLabel(item.Tier),
+						"mime":       cachePlainMime(item.Mime),
+						"size":       item.Size,
+						"cached":     true,
+						"degraded":   false,
+					})
+					return
+				}
+			}
+		}
+		a.handleWeiyunStreamResolve(w, r, body)
+		return
 	}
 	if body.CacheSeed != "" {
 		if err := a.cacheSetSeed(body.CacheSeed); err == nil {
@@ -191,13 +236,11 @@ func (a *App) handleStreamResolve(w http.ResponseWriter, r *http.Request) {
 		degraded:   resolved.Degraded,
 		requested:  resolved.RequestedTier.ID,
 		durationMs: body.DurationMs,
+		cacheSeed:  body.CacheSeed,
 	}
 	a.streamMu.Lock()
 	a.streams[token] = entry
 	a.streamMu.Unlock()
-	if body.CacheSeed != "" {
-		go a.cacheStore(entry, body.Mid, body.CacheSeed, body.DurationMs)
-	}
 	// mid 粒度限速桶：resolve 即建档（换档刷新倍率），跨 token 共享，重取链接刷不出额度
 	a.paceBucket(resolved.Mid, paceRateFor(total, body.DurationMs))
 
@@ -262,6 +305,7 @@ func (a *App) handleStreamProxy(w http.ResponseWriter, r *http.Request) {
 	if ok && !probeOver {
 		entry.hits++
 		entry.expiresAt = time.Now().Add(streamIdleTTL) // 滑动续期：活跃播放不过期
+		entry.activeRequests++
 	}
 	a.streamMu.Unlock()
 	if probeOver {
@@ -272,6 +316,13 @@ func (a *App) handleStreamProxy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, -1, "播放流不存在或已过期，请重新播放")
 		return
 	}
+	defer func() {
+		a.streamMu.Lock()
+		if entry.activeRequests > 0 {
+			entry.activeRequests--
+		}
+		a.streamMu.Unlock()
+	}()
 
 	// 解析客户端 Range
 	rng := typhoeus.ParseRange(r.Header.Get("Range"))
@@ -286,12 +337,27 @@ func (a *App) handleStreamProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 回源
-	up, err := typhoeus.OpenRange(r.Context(), entry.url, rng)
+	up, err := a.openStreamRange(r.Context(), entry, rng)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	defer up.Body.Close()
+
+	if rng != nil && entry.encrypted {
+		// An encrypted range is only meaningful when the body starts at the
+		// requested absolute byte. A 200 response (or a shifted Content-Range)
+		// means the keystream would be aligned to the wrong offset: reject it
+		// instead of streaming noise to the player.
+		wantStart := int64(0)
+		if rng.Start != nil {
+			wantStart = *rng.Start
+		}
+		if err := validateRangeResponse(up, wantStart); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
 
 	headers := w.Header()
 	headers.Set("Accept-Ranges", "bytes")
@@ -331,8 +397,11 @@ func (a *App) handleStreamProxy(w http.ResponseWriter, r *http.Request) {
 	// 限速：写出经 mid 令牌桶（≈3× 实时码率）——「整曲一把抓」被拖成接近实时，
 	// 正常播放与 seek 只吃突发额度，无感。
 	bucket := a.paceBucket(entry.mid, paceRateFor(entry.total, entry.durationMs))
-	written, err := typhoeus.CopyRange(r.Context(), &pacedWriter{w: discardLogger{w}, b: bucket, ctx: r.Context()}, entry.url, up,
+	written, err := copyStreamRange(r.Context(), &pacedWriter{w: discardLogger{w}, b: bucket, ctx: r.Context()}, entry, up,
 		entry.cipher, start, end, entry.total > 0, resume)
+	if written > 0 {
+		a.cacheAfterPlayback(entry)
+	}
 	if err == nil {
 		return
 	}
@@ -348,6 +417,95 @@ func (a *App) handleStreamProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	// 到这里才是真故障：上游 reset / 提前 EOF / 续传失败（重连后仍没补完）。
 	logWarn("回源流提前结束（已发 %d 字节，起点 %d）: %v", written, start, err)
+}
+
+func (a *App) openStreamRange(ctx context.Context, entry *streamEntry, rng *typhoeus.ByteRange) (*typhoeus.UpstreamResponse, error) {
+	if entry.opener != nil {
+		return entry.opener.OpenRange(ctx, entry.url, rng)
+	}
+	return typhoeus.OpenRange(ctx, entry.url, rng)
+}
+
+func copyStreamRange(ctx context.Context, w io.Writer, entry *streamEntry, first *typhoeus.UpstreamResponse,
+	cipher qmc.Cipher, start, end int64, totalKnown bool, resume int) (int64, error) {
+	if entry.opener == nil {
+		return typhoeus.CopyRange(ctx, w, entry.url, first, cipher, start, end, totalKnown, resume)
+	}
+	// Weiyun needs its cookie-bearing opener for resume requests as well.
+	// pos MUST start at the requested absolute offset: QMC is stateless, but
+	// decrypting a range at N with the keystream for 0 turns valid audio into noise.
+	pos := start
+	var written int64
+	resp := first
+	left := resume
+	for {
+		n, err := typhoeus.CopyRange(ctx, w, entry.url, resp, cipher, pos, end, totalKnown, 0)
+		written += n
+		pos += n
+		if err == nil {
+			return written, nil
+		}
+		if typhoeus.IsClientAbort(err) || ctx.Err() != nil {
+			return written, err
+		}
+		if left <= 0 {
+			return written, err
+		}
+		left--
+		select {
+		case <-ctx.Done():
+			return written, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+		next, rerr := entry.opener.OpenRange(ctx, entry.url, &typhoeus.ByteRange{Start: &pos, End: &end})
+		if rerr != nil {
+			return written, err
+		}
+		if err := validateRangeResponse(next, pos); err != nil {
+			_ = next.Body.Close()
+			return written, err
+		}
+		resp = next
+	}
+}
+
+// validateRangeResponse rejects an upstream that ignored (or shifted) the
+// requested range. Decrypting such a body would silently produce noise rather
+// than an obvious HTTP error, so the check is deliberately strict.
+func validateRangeResponse(up *typhoeus.UpstreamResponse, wantStart int64) error {
+	if up == nil {
+		return fmt.Errorf("回源响应为空")
+	}
+	if up.Status != http.StatusPartialContent {
+		return fmt.Errorf("回源未返回 206（status=%d）", up.Status)
+	}
+	if up.ContentRange != "" {
+		got := rangeContentStart(up.ContentRange)
+		if got >= 0 && got != wantStart {
+			return fmt.Errorf("回源起点不符：期望 %d，上游给 %d", wantStart, got)
+		}
+	}
+	return nil
+}
+
+func rangeContentStart(contentRange string) int64 {
+	spec := strings.TrimSpace(contentRange)
+	if !strings.HasPrefix(strings.ToLower(spec), "bytes ") {
+		return -1
+	}
+	span, _, ok := strings.Cut(strings.TrimSpace(spec[len("bytes "):]), "/")
+	if !ok {
+		return -1
+	}
+	left, _, ok := strings.Cut(span, "-")
+	if !ok {
+		return -1
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(left), 10, 64)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
 }
 
 // discardLogger 包装 writer（占位，保持 io.Writer 语义）。

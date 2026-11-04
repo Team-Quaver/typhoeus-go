@@ -31,6 +31,10 @@ import (
 // （含末尾空格）。stdout 上只有带此前缀的行会被主进程当凭证，其余按日志处理。
 const HandoffPrefix = "QCRED1 "
 
+// WeiyunHandoffPrefix 微云 API Key 的第二条交接信封。与 QQ 凭证分离：两者生命
+// 周期不同，且主进程把它们存进同一 safeStorage 封装时也不能混在一个 JSON 对象里。
+const WeiyunHandoffPrefix = "WYAUTH1 "
+
 // CredentialMode 凭证持久化模式。
 type CredentialMode string
 
@@ -83,6 +87,10 @@ type Session struct {
 	gen uint64
 	cl  *qqmusic.Client
 	out *bufio.Writer
+	in  *bufio.Reader
+	// pendingWeiyunAuth 在 NewSession 阻塞读 stdin 时暂存微云授权；
+	// NewApp 构造完 weiyunStore 后立即取走，避免包初始化环。
+	pendingWeiyunAuth *weiyunAuth
 
 	listeners   []func()
 	listenersMu sync.Mutex
@@ -100,6 +108,7 @@ func NewSession() (*Session, error) {
 		mode: mode,
 		cred: &qqmusic.Credential{},
 		out:  bufio.NewWriter(os.Stdout),
+		in:   bufio.NewReader(os.Stdin),
 	}
 	cl, err := qqmusic.NewClient(s.cred, filepath.Join(dir, "device.json"), "")
 	if err != nil {
@@ -115,9 +124,9 @@ func NewSession() (*Session, error) {
 	return s, nil
 }
 
-// readInjectedCredential 读主进程注入的第一行凭证（仅 external 模式；阻塞读）。
+// readInjectedCredential 读主进程注入的 QQ 凭证与微云 API Key（仅 external 模式；阻塞读）。
 func (s *Session) readInjectedCredential() {
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	line, err := s.in.ReadString('\n')
 	if err != nil && line == "" {
 		logInfo("父进程未注入凭证（stdin 立即 EOF），按未登录处理")
 		return
@@ -140,6 +149,41 @@ func (s *Session) readInjectedCredential() {
 		logInfo("已接收父进程注入的登录凭证 musicid=%d", cred.MusicID)
 		s.setCred(&cred)
 	}
+
+	// 第二行可缺省：老主进程、纯 QQ 登录和首次启动都还没有微云授权。
+	weiyun, werr := s.in.ReadString('\n')
+	if werr != nil && weiyun == "" {
+		return
+	}
+	weiyun = strings.TrimSpace(weiyun)
+	if !strings.HasPrefix(weiyun, WeiyunHandoffPrefix) {
+		logWarn("微云授权注入行前缀不匹配，按未配置处理")
+		return
+	}
+	wpayload := strings.TrimSpace(strings.TrimPrefix(weiyun, WeiyunHandoffPrefix))
+	if wpayload == "" || wpayload == "null" {
+		return
+	}
+	var auth struct {
+		Token  string `json:"token"`
+		MCPURL string `json:"mcpUrl"`
+	}
+	if json.Unmarshal([]byte(wpayload), &auth) != nil || strings.TrimSpace(auth.Token) == "" {
+		logWarn("注入的微云授权解析失败，按未配置处理")
+		return
+	}
+	s.mu.Lock()
+	s.pendingWeiyunAuth = &weiyunAuth{Token: auth.Token, MCPURL: auth.MCPURL}
+	s.mu.Unlock()
+	logInfo("已接收父进程注入的微云授权")
+}
+
+func (s *Session) takePendingWeiyunAuth() *weiyunAuth {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	auth := s.pendingWeiyunAuth
+	s.pendingWeiyunAuth = nil
+	return auth
 }
 
 // Client 底层 API 客户端。
@@ -290,8 +334,32 @@ func (s *Session) emitCredential(cred *qqmusic.Credential) {
 		raw, _ := json.Marshal(cred)
 		payload = string(raw)
 	}
+	s.emitLine(HandoffPrefix + payload)
+}
+
+// emitWeiyunAuth 把微云 API Key 交给父进程加密落盘。它只在外部模式下出现；
+// 主进程解析失败时仍按普通日志处理，绝不会把 Token 写进日志。
+func (s *Session) emitWeiyunAuth(token, mcpURL string) {
+	if strings.TrimSpace(token) == "" {
+		s.emitLine(WeiyunHandoffPrefix + "null")
+		return
+	}
+	raw, err := json.Marshal(struct {
+		Token  string `json:"token"`
+		MCPURL string `json:"mcpUrl"`
+	}{Token: strings.TrimSpace(token), MCPURL: strings.TrimSpace(mcpURL)})
+	if err != nil {
+		logWarn("微云授权交接编码失败")
+		return
+	}
+	s.emitLine(WeiyunHandoffPrefix + string(raw))
+}
+
+// emitLine writes a complete handoff line and flushes immediately; the parent
+// process parses stdout line-by-line and never logs recognized handoffs.
+func (s *Session) emitLine(line string) {
 	s.mu.Lock()
-	_, _ = s.out.WriteString(HandoffPrefix + payload + "\n")
+	_, _ = s.out.WriteString(line + "\n")
 	_ = s.out.Flush()
 	s.mu.Unlock()
 }
