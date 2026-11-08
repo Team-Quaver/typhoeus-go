@@ -30,7 +30,8 @@ const (
 // PlayDurationReport 一次「听歌物理流水」上报。
 //
 // 这是音响力的原始播放流水，不是普通播放计数：上游会把 time 计入当日听歌时长。
-// 一次只报一段真实播放时间，调用方按累计时长分片即可。
+// 一次上报会计成一条听歌记录，调用方应在本曲切歌/结束时一次性上报累计时长，
+// 不要播放中途分片，否则同一首会被记成多条。
 type PlayDurationReport struct {
 	SongID             int64
 	AudioTimeMS        int64

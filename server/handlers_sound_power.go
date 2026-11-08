@@ -7,7 +7,7 @@ import (
 	"github.com/team-quaver/typhoeus-go/qqmusic"
 )
 
-// soundPowerReportBody 渲染层上报的一段真实播放时间。
+// soundPowerReportBody 渲染层上报的本曲累计真实播放时间。
 //
 // stream_token 只用于取回同一首已协商流的 vkey；拿不到时按 mid 重新取一次标准音质凭证。
 // 前端永远拿不到 vkey，也无需知道 imusic_tj 的 XML 协议。
