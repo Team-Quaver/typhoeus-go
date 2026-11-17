@@ -13,7 +13,9 @@ Quaver Typhoeus 的 Golang 服务后端。替代 L-1124 版 Python API 服务端
   - 会员门控（403）+ rank 回退链 + 自动降档模式（`auto`）+ 回退链降权（`deprioritize`）
   - 首块嗅探防「明文档位偶发下发密文」；加密流解密后嗅探验证 ekey 正确性
   - 标准 Range 中继（206/416/后缀区间），断流自动按已发字节重连续传（2 次）
-- **歌单**：详情、加歌/删歌（写侧 songType）、红心收藏/取消、歌单收藏/取消
+- **歌单**：详情、加歌/删歌、**全量重排序**（SeqSonglist）、红心收藏/取消、歌单收藏/取消；
+  写接口收**读侧 Song.type 原值**，写侧枚举转换收口在 SDK（`modules.ToSonglistWriteType`，
+  对齐上游 PR 306：0/1→0；5/111/112/113 原样；其余→1）
 - **每日三十首**：系统虚拟歌单 `dirid=202`（每天由服务端重新生成）
 - **无限电台**：猜你喜欢多轮串行拉取 + 按 mid 去重（上游单次只给 5 首）
 - **其余**：搜索（类型/综合/补全/热搜）、榜单、专辑、歌手、歌词、热评
@@ -67,10 +69,11 @@ QUAVER_PORT=3200 ./typhoeus-go        # 默认 http://127.0.0.1:3200
 | GET  | `/stream/{token}` | Range 透传中继（`<audio>` 的 src 指这里） |
 | POST | `/song/urls` | 批量取链（file_type 序号表见 `server/handlers_content.go`） |
 | GET  | `/song/{id\|mid}/detail` `/song/{v}/url` `/song/{v}/lyric` `/song/{id}/comments` | 歌曲域 |
-| POST | `/song/like` `/song/unlike` | 红心（`{song_id, song_type}`，**写侧枚举**=读侧-1） |
+| POST | `/song/like` `/song/unlike` | 红心（`{song_id, song_type}`，song_type=**读侧 Song.type 原值**） |
 | GET  | `/songlist/{id}/detail` | 歌单详情（每日30首走 `/recommend/daily`） |
 | POST/DELETE | `/songlist/{id}/like` | 歌单收藏/取消 |
 | POST/DELETE | `/songlist/{dirid}/songs` | 加歌/删歌（`{song_id, song_type, tid?}`） |
+| POST | `/songlist/{dirid}/order` | 歌单全量重排序（`{tid?, songs:[{song_id, song_type}…]}`；songs 必须是**全部**歌曲的新顺序，部分提交会打乱未提交歌曲） |
 | GET  | `/songlist/fav/check` | 已收藏歌单 ID 集合 |
 | GET  | `/search` `/search/general` `/search/complete` `/search/hotkey` | 搜索域 |
 | GET  | `/recommend/guess` `/recommend/songlist` `/recommend/newsong` `/recommend/daily` | 推荐域 |

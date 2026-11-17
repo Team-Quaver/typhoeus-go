@@ -351,7 +351,7 @@ func (a *App) handleSongComments(w http.ResponseWriter, r *http.Request) {
 
 type songLikeBody struct {
 	SongID   int64 `json:"song_id"`
-	SongType int64 `json:"song_type"` // 写侧枚举（读侧 Song.type - 1）
+	SongType int64 `json:"song_type"` // 读侧 Song.type 原值；写侧转换在 SDK 参数构造处统一做
 }
 
 func (a *App) handleSongLike(w http.ResponseWriter, r *http.Request) {
@@ -480,7 +480,7 @@ func (a *App) handleSonglistFavCheck(w http.ResponseWriter, _ *http.Request) {
 
 type songlistSongBody struct {
 	SongID   int64 `json:"song_id"`
-	SongType int64 `json:"song_type"` // 写侧枚举；发读侧原值会静默空操作
+	SongType int64 `json:"song_type"` // 读侧 Song.type 原值；写侧转换在 SDK 参数构造处统一做
 	Tid      int64 `json:"tid"`       // 歌单 tid（自建歌单知道就传）
 }
 
@@ -513,6 +513,48 @@ func (a *App) handleSonglistDelSong(w http.ResponseWriter, r *http.Request) {
 		return a.songlist.DelSongs(dirid, body.Tid,
 			[]modules.SongRef{{SongID: body.SongID, SongType: body.SongType}})
 	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeOK(w, map[string]any{"ok": ok})
+}
+
+type songlistOrderBody struct {
+	Tid   int64                `json:"tid"`   // 歌单 tid（自建歌单知道就传）
+	Songs []songlistOrderEntry `json:"songs"` // 歌单**全部**歌曲的新顺序（读侧 song_type）
+}
+
+type songlistOrderEntry struct {
+	SongID   int64 `json:"song_id"`
+	SongType int64 `json:"song_type"`
+}
+
+// handleSonglistReorder POST /songlist/{dirid}/order
+//
+// 全量重排（SeqSonglist）：songs 必须覆盖歌单全部歌曲 —— 只交一部分时上游照样
+// 返回成功，但没交的那部分顺序会被打乱，所以这里把「空列表」当参数错误拦下，
+// 完整性由调用方对照歌单详情保证（部分列表服务端无从校验）。
+func (a *App) handleSonglistReorder(w http.ResponseWriter, r *http.Request) {
+	var body songlistOrderBody
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	if len(body.Songs) == 0 {
+		writeErr(w, http.StatusUnprocessableEntity, -1, "songs 不能为空：重排必须提交歌单全部歌曲的新顺序")
+		return
+	}
+	var dirid int64
+	fmt.Sscanf(r.PathValue("dirid"), "%d", &dirid)
+	refs := make([]modules.SongRef, 0, len(body.Songs))
+	for _, s := range body.Songs {
+		if s.SongID <= 0 {
+			writeErr(w, http.StatusUnprocessableEntity, -1, "songs 里存在非法 song_id")
+			return
+		}
+		refs = append(refs, modules.SongRef{SongID: s.SongID, SongType: s.SongType})
+	}
+	ok, err := a.call2(func() (bool, error) { return a.songlist.ReorderSongs(dirid, body.Tid, refs) })
 	if err != nil {
 		writeError(w, err)
 		return
