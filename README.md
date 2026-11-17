@@ -32,6 +32,7 @@ QUAVER_PORT=3200 ./typhoeus-go        # 默认 http://127.0.0.1:3200
 |---|---|
 | `QUAVER_PORT` | 监听端口（默认 3200） |
 | `QUAVER_CONFIG_DIR` | 配置根目录（Electron 主进程注入） |
+| `QUAVER_CACHE_DIR` | 缓存根目录（Electron 主进程注入；音乐缓存落在其 `music/` 下） |
 | `QUAVER_CREDENTIAL_MODE=external` | 凭证经 stdin/stdout 交接给主进程加密落盘；未设 = memory 模式（登录只驻内存） |
 | `QSG_DEBUG_CGI=1` | （诊断用）向 stderr 打印每条 CGI 请求体——**含凭证，勿在日志中留存** |
 
@@ -41,6 +42,12 @@ QUAVER_PORT=3200 ./typhoeus-go        # 默认 http://127.0.0.1:3200
 - memory 模式绝不读写凭证明文——宁可不持久化。
 
 设备指纹 `device.json`（非密钥）与缓存 `device.cache.json`（QIMEI/匿名会话）存于配置目录。
+
+音乐磁盘缓存（弱网复播，加密落盘 `*.quaverlocalcache`）走**缓存目录**，与配置分家：
+Linux `$XDG_CACHE_HOME/quaver-music`、Windows `%LocalAppData%\Quaver Music\Quaver Cache`、
+macOS `~/Library/Caches/Quaver Music`；用户可在设置页自定义位置（主进程经 `QUAVER_CACHE_DIR`
+注入，或 `POST /cache/music/dir` 热切换，已有缓存随之搬迁）。旧版落在配置目录 `cache/music`
+下的缓存，首次打开默认缓存目录时自动搬家。
 
 ## HTTP API
 

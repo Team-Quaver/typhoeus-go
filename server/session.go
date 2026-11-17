@@ -4,6 +4,9 @@
 //   - 配置根目录：Linux $XDG_CONFIG_HOME/quaver-music（默认 ~/.config/quaver-music）、
 //     Windows %AppData%/Quaver Music、macOS ~/Library/Application Support/Quaver Music。
 //     Electron 拉起本进程时会显式下传 QUAVER_CONFIG_DIR。
+//   - 缓存根目录（可再生的大字节，与配置分家）：Linux $XDG_CACHE_HOME/quaver-music、
+//     Windows %LocalAppData%/Quaver Music/Quaver Cache、macOS ~/Library/Caches/Quaver Music。
+//     Electron 显式下传 QUAVER_CACHE_DIR（含用户在设置页自定义的位置）。
 //   - **凭证由 Electron 主进程独占，本包从不读写凭证明文。** 磁盘上只有密文
 //     credential.enc，钥匙在系统密钥管理器里。主进程启动时通过 stdin 注入一行
 //     `QCRED1 {json}`（或 `QCRED1 null`）；本进程登录/刷新/登出时往 stdout 回写
@@ -75,6 +78,42 @@ func ConfigDir() string {
 		home, _ := os.UserHomeDir()
 		return filepath.Join(home, ".config", "quaver-music")
 	}
+}
+
+// CacheDir 缓存根目录（与 ui/electron/config.ts:cacheDir 保持一致）。
+//
+// 为什么与配置目录分家：音乐缓存是几个 GiB 的可再生字节，混进配置目录会被备份/同步工具
+// 一起搬走，Linux 上也违背 XDG 的分工（config 存设置、cache 存可丢数据）。
+// Windows/macOS 的名字带 "Quaver Cache" 后缀，与 Chromium 自己的 Cache 目录一眼可分
+// （此前两者只差大小写：Cache / cache）。
+func CacheDir() string {
+	if override := strings.TrimSpace(os.Getenv("QUAVER_CACHE_DIR")); override != "" {
+		return override
+	}
+	switch runtime.GOOS {
+	case "windows":
+		base := strings.TrimSpace(os.Getenv("LOCALAPPDATA"))
+		if base == "" {
+			home, _ := os.UserHomeDir()
+			base = filepath.Join(home, "AppData", "Local")
+		}
+		return filepath.Join(base, "Quaver Music", "Quaver Cache")
+	case "darwin":
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, "Library", "Caches", "Quaver Music")
+	default:
+		if xdg := strings.TrimSpace(os.Getenv("XDG_CACHE_HOME")); xdg != "" {
+			return filepath.Join(xdg, "quaver-music")
+		}
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, ".cache", "quaver-music")
+	}
+}
+
+// LegacyMusicCacheDir 旧版音乐缓存目录（配置目录下的 cache/music）。
+// 只用于升级时的一次性搬家与清扫，新数据一律落 CacheDir。
+func LegacyMusicCacheDir() string {
+	return filepath.Join(ConfigDir(), "cache", "music")
 }
 
 // Session 进程级会话：凭证变更集中处理（对标 quaver_server/session.py）。

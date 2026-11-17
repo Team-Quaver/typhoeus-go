@@ -63,7 +63,8 @@ type App struct {
 	paceMu  sync.Mutex
 	paceMap map[string]*byteBucket
 
-	// 本地音乐缓存（弱网优化）：磁盘数据在 cache/music/*.quaverlocalcache，
+	// 本地音乐缓存（弱网优化）：磁盘数据在缓存目录 music/*.quaverlocalcache
+	// （CacheDir：Linux XDG_CACHE_HOME / Windows·macOS Quaver Cache，可由用户自定义），
 	// 前端 seed 只驻渲染层；cacheLimit 为用户设置的上限（字节，0=默认）。
 	musicCache *musicCache
 	cacheLimit *atomic.Int64
@@ -182,6 +183,7 @@ func (a *App) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /cache/music/status", a.handleMusicCacheStatus)
 	mux.HandleFunc("POST /cache/music/clear", a.handleMusicCacheClear)
 	mux.HandleFunc("POST /cache/music/limit", a.handleMusicCacheSetLimit)
+	mux.HandleFunc("POST /cache/music/dir", a.handleMusicCacheSetDir)
 	mux.HandleFunc("GET /cache/music/stream/{token}", a.handleMusicCacheStream)
 	mux.HandleFunc("POST /sound-power/report", a.handleSoundPowerReport)
 

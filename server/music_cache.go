@@ -28,7 +28,12 @@ import (
 
 // 音乐磁盘缓存（弱网优化；不是下载功能）。
 //
-// 布局（全部在配置目录 cache/music/ 下）：
+// 位置：缓存根目录下的 music/（CacheDir，见 session.go）。Linux 走 XDG_CACHE_HOME，
+// Windows/macOS 是与 Chromium 的 Cache 明确区分开的 Quaver Cache / Caches；
+// 用户可在设置页自定义位置（主进程经 QUAVER_CACHE_DIR 下传，或 POST /cache/music/dir 热切换）。
+// 旧版落在配置目录 cache/music 下，首次打开时整目录搬家（adoptLegacyDirLocked）。
+//
+// 布局（全部在该目录下）：
 //
 //	index.quaverlocalcache   加密索引（首 64 字节是混淆噪声，JSON 之后 AEAD 加密）
 //	<32hex>.quaverlocalcache 每首歌一个随机名分片文件（AES-CTR 密文；不含 MID/歌名）
@@ -88,9 +93,14 @@ type musicCache struct {
 	readers map[string]*cacheReader
 }
 
+// musicCacheDir 音乐缓存目录 = 缓存根目录/music。
+func musicCacheDir() string {
+	return filepath.Join(CacheDir(), "music")
+}
+
 func newMusicCache() *musicCache {
 	return &musicCache{
-		dir:     filepath.Join(ConfigDir(), "cache", "music"),
+		dir:     musicCacheDir(),
 		readers: map[string]*cacheReader{},
 	}
 }
@@ -168,6 +178,7 @@ func (c *musicCache) openLocked(lazy bool) (bool, error) {
 	if c.seed != "" {
 		return true, nil
 	}
+	c.adoptLegacyDirLocked()
 	if err := os.MkdirAll(c.dir, 0o700); err != nil {
 		return false, fmt.Errorf("创建缓存目录失败: %w", err)
 	}
@@ -215,6 +226,127 @@ func (c *musicCache) openLocked(lazy bool) (bool, error) {
 	c.seed = idx.Seed
 	c.cleanupLocked()
 	return true, nil
+}
+
+// adoptLegacyDirLocked 把旧版落在配置目录里的缓存整目录搬到默认缓存目录。
+//
+// 只在「当前目录就是平台默认缓存目录」时做：自定义位置是用户显式指定的空目录，
+// 不该被旧数据塞满（也不该把别处的缓存搬走）。只做一次、只在目标还没有索引时做；
+// 搬不动（跨盘 EXDEV / 目标只读 / 旧目录权限）就退回「新目录从零开始」，绝不因为搬家
+// 失败而让缓存整体不可用。旧目录的残片由 sweepLegacyDirLocked 收尾——不然用户点
+// 「清理缓存」后配置目录里还压着几个 GiB。
+func (c *musicCache) adoptLegacyDirLocked() {
+	if c.dir != musicCacheDir() {
+		return
+	}
+	legacy := LegacyMusicCacheDir()
+	if legacy == c.dir {
+		return
+	}
+	if _, err := os.Stat(filepath.Join(legacy, cacheIndexName)); err != nil {
+		return
+	}
+	if _, err := os.Stat(filepath.Join(c.dir, cacheIndexName)); err == nil {
+		c.sweepLegacyDirLocked()
+		return
+	}
+	if err := os.MkdirAll(c.dir, 0o700); err != nil {
+		return
+	}
+	entries, err := os.ReadDir(legacy)
+	if err != nil {
+		return
+	}
+	moved := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !cacheOwnedName(name) {
+			continue
+		}
+		if moveCacheFile(filepath.Join(legacy, name), filepath.Join(c.dir, name)) == nil {
+			moved++
+		}
+	}
+	if moved > 0 {
+		logInfo("音乐缓存已迁至缓存目录：%s（%d 个文件）", c.dir, moved)
+	}
+	c.sweepLegacyDirLocked()
+}
+
+// sweepLegacyDirLocked 删掉旧目录里剩下的本缓存文件（搬家失败/被跳过的残片）。
+// 只认本缓存的命名，别人的文件一个都不碰；目录空了顺手收掉。
+func (c *musicCache) sweepLegacyDirLocked() {
+	legacy := LegacyMusicCacheDir()
+	if legacy == c.dir {
+		return
+	}
+	if sweepCacheDir(legacy) {
+		_ = os.Remove(legacy)
+		_ = os.Remove(filepath.Dir(legacy)) // cache/：只有本缓存用过，空了就收
+	}
+}
+
+// sweepCacheDir 删掉 dir 下属于本缓存的文件（索引 / 分片 / .tmp），别人的文件一个都不碰。
+// 返回「目录是否已经空了」——调用方据此决定要不要把目录本身也收掉。
+func sweepCacheDir(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	rest := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !cacheOwnedName(entry.Name()) {
+			rest++
+			continue
+		}
+		if os.Remove(filepath.Join(dir, entry.Name())) != nil {
+			rest++
+		}
+	}
+	return rest == 0
+}
+
+// cacheOwnedName 这个文件名是否属于本缓存（索引 / 分片 / 写盘中断的 .tmp）。
+func cacheOwnedName(name string) bool {
+	return name == cacheIndexName || strings.HasSuffix(name, cacheFileExt) || strings.HasSuffix(name, ".tmp")
+}
+
+// moveCacheFile 先 rename（同盘瞬时），跨盘再退回「复制 + 删源」。
+// 复制走 .tmp 中转再改名：中途断电不会在目标留下一个看似完整的半截分片。
+func moveCacheFile(from, to string) error {
+	if err := os.Rename(from, to); err == nil {
+		return nil
+	}
+	src, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	tmp := to + ".tmp"
+	dst, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := dst.Sync(); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := dst.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, to); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	_ = os.Remove(from)
+	return nil
 }
 
 // cleanupLocked removes interrupted cache writes and data files that are no
@@ -713,6 +845,78 @@ func (a *App) cacheUserID() int64 {
 	return -1
 }
 
+// cacheSetDir 换音乐缓存目录（设置页「缓存位置」）。root 为空 = 回落平台默认缓存根目录。
+//
+// 已有缓存跟着搬：不搬就是「换个位置 = 几个 GiB 白占着旧盘」，而用户在界面上只看到
+// 「0 首」。搬家在锁内做（与落盘/清理互斥），失败只影响搬运本身 —— 新目录照样可用，
+// 旧目录的残片留给下一次 openLocked 的收尾。
+func (a *App) cacheSetDir(root string) (string, error) {
+	root = strings.TrimSpace(root)
+	if root != "" && !filepath.IsAbs(root) {
+		return "", errors.New("缓存位置必须是绝对路径")
+	}
+	dir := musicCacheDir()
+	if root != "" {
+		dir = filepath.Join(filepath.Clean(root), "music")
+	}
+	c := a.musicCache
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if dir == c.dir {
+		return c.dir, nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("缓存位置不可用: %w", err)
+	}
+	probe := filepath.Join(dir, ".write-probe.tmp")
+	if err := os.WriteFile(probe, []byte("quaver"), 0o600); err != nil {
+		return "", fmt.Errorf("缓存位置不可写: %w", err)
+	}
+	_ = os.Remove(probe)
+
+	from := c.dir
+	if _, err := os.Stat(filepath.Join(from, cacheIndexName)); err == nil {
+		_, dstErr := os.Stat(filepath.Join(dir, cacheIndexName))
+		freshTarget := errors.Is(dstErr, os.ErrNotExist)
+		if freshTarget {
+			entries, rerr := os.ReadDir(from)
+			if rerr == nil {
+				for _, entry := range entries {
+					if entry.IsDir() || !cacheOwnedName(entry.Name()) {
+						continue
+					}
+					_ = moveCacheFile(filepath.Join(from, entry.Name()), filepath.Join(dir, entry.Name()))
+				}
+			}
+			// 搬完把旧目录属于本缓存的字节收干净：留着就是「界面上 0 首、旧盘还压着几个 GiB」。
+			if sweepCacheDir(from) {
+				_ = os.Remove(from)
+			}
+		} else {
+			// 目标已经有自己的一份缓存（用户切回之前用过的目录）：**两份都留着**。
+			// 覆盖或清扫都会删掉用户另一处的真实缓存 —— 那是数据丢失，不是「整理」。
+			// 旧目录的字节仍可经「切回去 + 清理缓存」正常清掉。
+			logInfo("音乐缓存位置已切到既有缓存目录，原目录内容保留：%s", from)
+		}
+	}
+	c.dir = dir
+	c.seed = ""
+	c.idx = cacheIndex{}
+	// 令牌里存的是绝对路径：换目录后旧令牌指向的文件已经不在了，整表作废，
+	// 让播放器重新 resolve（而不是拿到一个 404 的播放流）。
+	c.readers = map[string]*cacheReader{}
+	logInfo("音乐缓存位置已切换：%s", dir)
+	return dir, nil
+}
+
+// cacheDir 当前生效的缓存目录（只读，不加锁也安全：切换在锁内整体替换字符串）。
+func (a *App) cacheDir() string {
+	c := a.musicCache
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dir
+}
+
 func (a *App) handleCacheSeed(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Seed string `json:"seed"`
@@ -737,10 +941,41 @@ func (a *App) handleMusicCacheStatus(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	if !ok {
-		writeOK(w, map[string]any{"items": 0, "bytes": int64(0), "limit_bytes": a.cacheLimit.Load()})
+		writeOK(w, map[string]any{"items": 0, "bytes": int64(0), "limit_bytes": a.cacheLimit.Load(), "dir": c.dir})
 		return
 	}
-	writeOK(w, map[string]any{"items": len(c.idx.Items), "bytes": c.idx.Bytes, "limit_bytes": a.cacheLimit.Load()})
+	writeOK(w, map[string]any{"items": len(c.idx.Items), "bytes": c.idx.Bytes, "limit_bytes": a.cacheLimit.Load(), "dir": c.dir})
+}
+
+// handleMusicCacheSetDir POST /cache/music/dir {dir}
+//
+// dir 为空 = 回到平台默认缓存位置。**只接受主进程调用**：路径是「在磁盘上写哪儿」的权限，
+// 与 /api/bg 同一条「请求参数不参与拼路径」红线 —— 渲染层改的是 quaver.conf 里的配置键，
+// 由主进程解析后下发。中继会透传 Sec-Fetch-Dest（渲染层伪造不了），带该头一律 403。
+func (a *App) handleMusicCacheSetDir(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(r.Header.Get("Sec-Fetch-Dest")) != "" {
+		writeErr(w, http.StatusForbidden, -1, "缓存位置只能由桌面主进程按配置文件设定")
+		return
+	}
+	var body struct {
+		Dir string `json:"dir"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	dir, err := a.cacheSetDir(body.Dir)
+	if err != nil {
+		writeErr(w, 422, -1, err.Error())
+		return
+	}
+	c := a.musicCache
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, err := c.openLocked(true); err != nil || c.seed == "" {
+		writeOK(w, map[string]any{"dir": dir, "items": 0, "bytes": int64(0), "limit_bytes": a.cacheLimit.Load()})
+		return
+	}
+	writeOK(w, map[string]any{"dir": dir, "items": len(c.idx.Items), "bytes": c.idx.Bytes, "limit_bytes": a.cacheLimit.Load()})
 }
 
 func (a *App) handleMusicCacheClear(w http.ResponseWriter, r *http.Request) {
@@ -768,7 +1003,7 @@ func (a *App) handleMusicCacheClear(w http.ResponseWriter, r *http.Request) {
 	for tok := range c.readers {
 		delete(c.readers, tok)
 	}
-	writeOK(w, map[string]any{"items": 0, "bytes": int64(0)})
+	writeOK(w, map[string]any{"items": 0, "bytes": int64(0), "dir": c.dir})
 }
 
 func (a *App) handleMusicCacheSetLimit(w http.ResponseWriter, r *http.Request) {
