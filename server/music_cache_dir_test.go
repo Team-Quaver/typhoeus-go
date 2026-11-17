@@ -1,7 +1,11 @@
 package server
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -234,6 +238,226 @@ func TestCacheSetDirKeepsBothWhenTargetHasCache(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(from, cacheIndexName)); err != nil {
 		t.Fatalf("source index must stay: %v", err)
+	}
+}
+
+// 升级过渡的完整链路：旧版写在配置目录里的加密缓存，升级后不必重新登录、不必重新缓冲，
+// 仍按原 mid + 档位命中，且解密出来的字节与升级前逐字一致（磁盘种子随索引一起搬家，
+// 前端半种仍在 localStorage —— 两半都没变，所以旧缓存不会变成解不开的死数据）。
+func TestCacheUpgradeKeepsOldEntriesPlayable(t *testing.T) {
+	cfg := t.TempDir()
+	cache := t.TempDir()
+	t.Setenv("QUAVER_CONFIG_DIR", cfg)
+	t.Setenv("QUAVER_CACHE_DIR", cache)
+
+	const mid = "001UpgradeMid"
+	const front = "0123456789abcdef0123456789abcdef"
+	plain := append([]byte("OggS"), bytes.Repeat([]byte("quaver-upgrade-"), 4096)...)
+
+	// —— 旧版本：缓存落在配置目录 cache/music 下 ——
+	legacy := LegacyMusicCacheDir()
+	old := &musicCache{dir: legacy, readers: map[string]*cacheReader{}}
+	if ok, err := old.openLocked(false); err != nil || !ok {
+		t.Fatalf("legacy open: %v", err)
+	}
+	id := randomTag()
+	enc, mac, err := cacheEntryIdentity(old.seed, mid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := cacheKey(old.seed, front, "data:"+id)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipherText := append([]byte(nil), plain...)
+	cipher.NewCTR(block, cacheNonce("data:"+id, 0)).XORKeyStream(cipherText, cipherText)
+	if err := os.WriteFile(filepath.Join(legacy, id+cacheFileExt), cipherText, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old.idx.Items = []cacheEntry{{
+		ID: id, UserID: -1, MidEnc: enc, MidMAC: mac, Tier: "320",
+		Mime: "audio/ogg", Size: int64(len(plain)),
+	}}
+	old.idx.Bytes = int64(len(plain))
+	old.idx.FrontMAC = cacheMidMAC(old.seed, front)
+	if err := old.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	diskSeed := old.seed
+
+	// —— 升级后：新进程只认缓存目录，旧目录不再被写入 ——
+	app := &App{musicCache: newMusicCache(), cacheLimit: &atomic.Int64{}, session: &Session{cred: &qqmusic.Credential{}}}
+	tok, item, err := app.cacheTryResolve(mid, front, "320")
+	if err != nil || tok == "" || item == nil {
+		t.Fatalf("upgraded cache must still hit: tok=%q item=%+v err=%v", tok, item, err)
+	}
+	if app.musicCache.seed != diskSeed {
+		t.Fatal("disk seed must survive the move, otherwise old tracks are undecryptable")
+	}
+	if item.Size != int64(len(plain)) {
+		t.Fatalf("size mismatch: %d", item.Size)
+	}
+
+	reader := app.cacheResolvePlayback(tok)
+	if reader == nil {
+		t.Fatal("playback token must resolve after the move")
+	}
+	f, err := os.Open(reader.filePath)
+	if err != nil {
+		t.Fatalf("moved file must be readable: %v", err)
+	}
+	defer f.Close()
+	got, err := io.ReadAll(&cacheDecryptReader{r: f, key: reader.dataKey, entryID: reader.entry.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatal("decrypted bytes differ after the upgrade move")
+	}
+	if err := validateCachedAudio(reader.filePath, reader.dataKey, reader.entry.ID, reader.entry.Mime); err != nil {
+		t.Fatalf("container check must still pass: %v", err)
+	}
+}
+
+// 搬家失败（缓存盘只读 / 磁盘满 / 权限不足）时**不许毁掉旧缓存**：宁可这次继续用旧目录，
+// 也不能「新目录空着、旧目录被清空」——那等于升级把用户几个 GiB 缓存白删了。
+func TestCacheUpgradeKeepsLegacyWhenMoveFails(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("需要 POSIX 权限位且非 root 才能构造只读目录")
+	}
+	cfg := t.TempDir()
+	cache := t.TempDir()
+	t.Setenv("QUAVER_CONFIG_DIR", cfg)
+	t.Setenv("QUAVER_CACHE_DIR", cache)
+
+	legacy := LegacyMusicCacheDir()
+	old := &musicCache{dir: legacy, readers: map[string]*cacheReader{}}
+	if ok, err := old.openLocked(false); err != nil || !ok {
+		t.Fatalf("legacy open: %v", err)
+	}
+	id := randomTag()
+	if err := os.WriteFile(filepath.Join(legacy, id+cacheFileExt), []byte("track"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old.idx.Items = []cacheEntry{{ID: id, Size: 5}}
+	old.idx.Bytes = 5
+	if err := old.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 目标不可写：缓存根被换成一个普通文件，MkdirAll 必定失败。
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("QUAVER_CACHE_DIR", blocker)
+
+	c := newMusicCache()
+	_, _ = c.openLocked(true) // 失败是预期的：这里断言的是「旧数据还在不在」
+
+	if _, err := os.Stat(filepath.Join(legacy, cacheIndexName)); err != nil {
+		t.Fatalf("legacy index must survive a failed move: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(legacy, id+cacheFileExt)); err != nil {
+		t.Fatalf("legacy track must survive a failed move: %v", err)
+	}
+}
+
+// 更常见的失败形态：目标目录能建、索引搬过去了，但某个分片搬不动（只读挂载 / 配额满 /
+// 单文件权限）。此时旧目录里那份**没搬成功的**分片必须留着，不能被收尾清扫删掉。
+func TestCacheUpgradeKeepsUnmovedTracks(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("需要 POSIX 权限位且非 root 才能构造只读目录")
+	}
+	cfg := t.TempDir()
+	cache := t.TempDir()
+	t.Setenv("QUAVER_CONFIG_DIR", cfg)
+	t.Setenv("QUAVER_CACHE_DIR", cache)
+
+	legacy := LegacyMusicCacheDir()
+	old := &musicCache{dir: legacy, readers: map[string]*cacheReader{}}
+	if ok, err := old.openLocked(false); err != nil || !ok {
+		t.Fatalf("legacy open: %v", err)
+	}
+	id := randomTag()
+	if err := os.WriteFile(filepath.Join(legacy, id+cacheFileExt), []byte("track"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old.idx.Items = []cacheEntry{{ID: id, Size: 5}}
+	old.idx.Bytes = 5
+	if err := old.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 目标目录只读：能 Stat/MkdirAll（已存在），但写不进去 → 每个文件都搬不动。
+	target := musicCacheDir()
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(target, 0o700) })
+
+	c := newMusicCache()
+	_, _ = c.openLocked(true)
+
+	if _, err := os.Stat(filepath.Join(legacy, id+cacheFileExt)); err != nil {
+		t.Fatalf("unmoved track must not be swept away: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(legacy, cacheIndexName)); err != nil {
+		t.Fatalf("index must stay when its tracks did not move: %v", err)
+	}
+}
+
+// 手动换位置途中搬不动（目标盘满/只读）：必须报错并保持原位置可用，绝不半途清场。
+func TestCacheSetDirFailureKeepsSourceIntact(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("需要 POSIX 权限位且非 root 才能构造只读目录")
+	}
+	cfg := t.TempDir()
+	first := t.TempDir()
+	t.Setenv("QUAVER_CONFIG_DIR", cfg)
+	t.Setenv("QUAVER_CACHE_DIR", first)
+
+	app := &App{musicCache: newMusicCache(), cacheLimit: &atomic.Int64{}, session: &Session{cred: &qqmusic.Credential{}}}
+	c := app.musicCache
+	if ok, err := c.openLocked(false); err != nil || !ok {
+		t.Fatalf("open: %v", err)
+	}
+	id := randomTag()
+	if err := os.WriteFile(filepath.Join(c.dir, id+cacheFileExt), []byte("track"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.idx.Items = []cacheEntry{{ID: id, Size: 5}}
+	c.idx.Bytes = 5
+	if err := c.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	from := c.dir
+
+	// 目标根可建可写（探针能过），但 music/ 子目录只读 → 分片搬不动。
+	next := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(next, "music"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(next, "music"), 0o700) })
+
+	if _, err := app.cacheSetDir(next); err == nil {
+		t.Fatal("a failed relocation must report an error")
+	}
+	if app.cacheDir() != from {
+		t.Fatal("failed relocation must keep the active dir")
+	}
+	if _, err := os.Stat(filepath.Join(from, id+cacheFileExt)); err != nil {
+		t.Fatalf("source track must survive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(from, cacheIndexName)); err != nil {
+		t.Fatalf("source index must survive: %v", err)
+	}
+	if ok, err := c.openLocked(true); err != nil || !ok || len(c.idx.Items) != 1 {
+		t.Fatalf("source cache must stay usable: ok=%v err=%v", ok, err)
 	}
 }
 

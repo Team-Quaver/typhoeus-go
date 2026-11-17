@@ -231,10 +231,12 @@ func (c *musicCache) openLocked(lazy bool) (bool, error) {
 // adoptLegacyDirLocked 把旧版落在配置目录里的缓存整目录搬到默认缓存目录。
 //
 // 只在「当前目录就是平台默认缓存目录」时做：自定义位置是用户显式指定的空目录，
-// 不该被旧数据塞满（也不该把别处的缓存搬走）。只做一次、只在目标还没有索引时做；
-// 搬不动（跨盘 EXDEV / 目标只读 / 旧目录权限）就退回「新目录从零开始」，绝不因为搬家
-// 失败而让缓存整体不可用。旧目录的残片由 sweepLegacyDirLocked 收尾——不然用户点
-// 「清理缓存」后配置目录里还压着几个 GiB。
+// 不该被旧数据塞满（也不该把别处的缓存搬走）。只做一次、只在目标还没有索引时做。
+//
+// **搬家按文件确认，不是「尽力而为后清场」**：只有真的落到新目录的文件才从旧目录删除。
+// 搬不动（目标只读 / 配额满 / 单文件权限）就原样留在旧目录 —— 宁可留一份用户还能切回去
+// 用的缓存，也绝不能「新目录空着、旧目录被清空」（那等于升级白删几个 GiB）。
+// 索引最后搬：它在，才代表这份缓存完整可用；先搬索引会在中途失败时留下指向空气的索引。
 func (c *musicCache) adoptLegacyDirLocked() {
 	if c.dir != musicCacheDir() {
 		return
@@ -247,7 +249,11 @@ func (c *musicCache) adoptLegacyDirLocked() {
 		return
 	}
 	if _, err := os.Stat(filepath.Join(c.dir, cacheIndexName)); err == nil {
-		c.sweepLegacyDirLocked()
+		// 新目录已有完整的一份：旧目录是上一轮搬完剩下的残片，收掉。
+		if sweepCacheDir(legacy) {
+			_ = os.Remove(legacy)
+			_ = os.Remove(filepath.Dir(legacy))
+		}
 		return
 	}
 	if err := os.MkdirAll(c.dir, 0o700); err != nil {
@@ -258,27 +264,30 @@ func (c *musicCache) adoptLegacyDirLocked() {
 		return
 	}
 	moved := 0
+	failed := 0
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !cacheOwnedName(name) {
+		if entry.IsDir() || !cacheOwnedName(name) || name == cacheIndexName {
 			continue
 		}
-		if moveCacheFile(filepath.Join(legacy, name), filepath.Join(c.dir, name)) == nil {
-			moved++
+		if err := moveCacheFile(filepath.Join(legacy, name), filepath.Join(c.dir, name)); err != nil {
+			failed++
+			continue
 		}
+		_ = os.Remove(filepath.Join(legacy, name)) // 复制分支的收尾；rename 分支已删过
+		moved++
 	}
+	if failed > 0 {
+		logWarn("音乐缓存搬家未完成：%d 个文件搬不动，旧目录内容保留（%s）", failed, legacy)
+		return
+	}
+	if err := moveCacheFile(filepath.Join(legacy, cacheIndexName), filepath.Join(c.dir, cacheIndexName)); err != nil {
+		logWarn("音乐缓存索引搬家失败，旧目录内容保留（%s）: %v", legacy, err)
+		return
+	}
+	_ = os.Remove(filepath.Join(legacy, cacheIndexName))
 	if moved > 0 {
 		logInfo("音乐缓存已迁至缓存目录：%s（%d 个文件）", c.dir, moved)
-	}
-	c.sweepLegacyDirLocked()
-}
-
-// sweepLegacyDirLocked 删掉旧目录里剩下的本缓存文件（搬家失败/被跳过的残片）。
-// 只认本缓存的命名，别人的文件一个都不碰；目录空了顺手收掉。
-func (c *musicCache) sweepLegacyDirLocked() {
-	legacy := LegacyMusicCacheDir()
-	if legacy == c.dir {
-		return
 	}
 	if sweepCacheDir(legacy) {
 		_ = os.Remove(legacy)
@@ -848,8 +857,8 @@ func (a *App) cacheUserID() int64 {
 // cacheSetDir 换音乐缓存目录（设置页「缓存位置」）。root 为空 = 回落平台默认缓存根目录。
 //
 // 已有缓存跟着搬：不搬就是「换个位置 = 几个 GiB 白占着旧盘」，而用户在界面上只看到
-// 「0 首」。搬家在锁内做（与落盘/清理互斥），失败只影响搬运本身 —— 新目录照样可用，
-// 旧目录的残片留给下一次 openLocked 的收尾。
+// 「0 首」。搬家在锁内做（与落盘/清理互斥），且**按文件确认**：只有真的搬成功的才删源，
+// 有任何一个搬不动就整份留在旧目录并报错 —— 绝不「新目录空着、旧目录被清空」。
 func (a *App) cacheSetDir(root string) (string, error) {
 	root = strings.TrimSpace(root)
 	if root != "" && !filepath.IsAbs(root) {
@@ -880,14 +889,29 @@ func (a *App) cacheSetDir(root string) (string, error) {
 		freshTarget := errors.Is(dstErr, os.ErrNotExist)
 		if freshTarget {
 			entries, rerr := os.ReadDir(from)
-			if rerr == nil {
-				for _, entry := range entries {
-					if entry.IsDir() || !cacheOwnedName(entry.Name()) {
-						continue
-					}
-					_ = moveCacheFile(filepath.Join(from, entry.Name()), filepath.Join(dir, entry.Name()))
-				}
+			if rerr != nil {
+				return "", fmt.Errorf("读取原缓存目录失败: %w", rerr)
 			}
+			failed := 0
+			for _, entry := range entries {
+				name := entry.Name()
+				if entry.IsDir() || !cacheOwnedName(name) || name == cacheIndexName {
+					continue
+				}
+				if err := moveCacheFile(filepath.Join(from, name), filepath.Join(dir, name)); err != nil {
+					failed++
+					continue
+				}
+				_ = os.Remove(filepath.Join(from, name))
+			}
+			if failed > 0 {
+				// 索引最后搬：搬不动就整份留在旧目录，用户切回去仍能用。
+				return "", fmt.Errorf("有 %d 个缓存文件搬不到新位置（磁盘满/权限不足？），已保留原位置的缓存", failed)
+			}
+			if err := moveCacheFile(filepath.Join(from, cacheIndexName), filepath.Join(dir, cacheIndexName)); err != nil {
+				return "", fmt.Errorf("缓存索引搬不到新位置，已保留原位置的缓存: %w", err)
+			}
+			_ = os.Remove(filepath.Join(from, cacheIndexName))
 			// 搬完把旧目录属于本缓存的字节收干净：留着就是「界面上 0 首、旧盘还压着几个 GiB」。
 			if sweepCacheDir(from) {
 				_ = os.Remove(from)
