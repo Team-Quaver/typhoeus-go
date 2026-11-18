@@ -271,3 +271,32 @@ func TestNormalizeVipIndependentDates(t *testing.T) {
 		t.Fatalf("expiry fields lost/mixed: %+v", out)
 	}
 }
+
+// TestNormalizeSonglistDetailCreatorTopLevel 歌单详情的 creator 必须在顶层，
+// 前端 SonglistDetail.Creator 按顶层字段解析；嵌套在 info 里时名字显示不出来，
+// 只剩“ · N 首”的分隔点。
+func TestNormalizeSonglistDetailCreatorTopLevel(t *testing.T) {
+	raw := json.RawMessage(`{"dirinfo":{"id":77,"dirName":"收藏","song_cnt":3,"creator":{"uin":"123","nick":"作者A"}},"songlist":[],"hasmore":0,"total":3}`)
+	out := normalizeSonglistDetail(raw)
+	creator, ok := out["creator"].(obj)
+	if !ok || creator["nick"] != "作者A" {
+		t.Fatalf("top-level creator = %v; want nick 作者A", out["creator"])
+	}
+	info, ok := out["info"].(obj)
+	if !ok {
+		t.Fatalf("info = %v", out["info"])
+	}
+	if _, ok := info["creator"]; !ok {
+		t.Fatal("info.creator should remain for compatibility")
+	}
+}
+
+// TestNormalizeSonglistDetailCreatorFallback 没有 creator 对象时用 dirinfo.nickname 兜底。
+func TestNormalizeSonglistDetailCreatorFallback(t *testing.T) {
+	raw := json.RawMessage(`{"dirinfo":{"id":77,"nickname":"自建作者","song_cnt":3},"songlist":[],"hasmore":0,"total":3}`)
+	out := normalizeSonglistDetail(raw)
+	creator, ok := out["creator"].(obj)
+	if !ok || creator["nick"] != "自建作者" {
+		t.Fatalf("creator = %v; want nickname fallback", out["creator"])
+	}
+}

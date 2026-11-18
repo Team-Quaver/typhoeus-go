@@ -156,16 +156,26 @@ func normalizeSonglistDetail(raw json.RawMessage) obj {
 	d := decodeObj(raw)
 	dirinfo := objOf(d, "dirinfo")
 	info := songlistItem(dirinfo)
+	var creator obj
 	if c := objOf(dirinfo, "creator"); c != nil {
-		info["creator"] = obj{
+		creator = obj{
 			"musicid":     numOf(c, "musicid", "uIN", "uin"),
 			"nick":        strOf(c, "nick", "name"),
 			"headurl":     strOf(c, "headurl", "avatar"),
 			"encrypt_uin": strOf(c, "encrypt_uin", "encryptUin"),
 		}
+		info["creator"] = creator
+	}
+	if creator == nil && dirinfo != nil {
+		// 自建歌单详情可能没有独立 creator 对象；dirinfo 自身带 nickname 时
+		// 用它兜底，避免前端只显示“ · N 首”。
+		if nick := strOf(dirinfo, "nickname", "creator_nick"); nick != "" {
+			creator = obj{"nick": nick}
+		}
 	}
 	return obj{
 		"info":    info,
+		"creator": creator,
 		"songs":   orArr(d["songlist"]),
 		"hasmore": numOf(d, "hasmore"),
 		"total":   numOf(d, "total_song_num", "total"),
